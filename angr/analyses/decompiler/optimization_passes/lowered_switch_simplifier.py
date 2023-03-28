@@ -1,12 +1,18 @@
 from typing import Optional, Tuple, Union, List, DefaultDict, TYPE_CHECKING
 from collections import defaultdict, OrderedDict
+import copy
+from typing import Optional, Tuple, Union, TYPE_CHECKING
 import logging
 
 import networkx
 
 from ailment import Block, AILBlockWalkerBase
 from ailment.statement import ConditionalJump, Label, Assignment, Jump
-from ailment.expression import Expression, BinaryOp, Const, Load
+from ailment.expression import Expression, BinaryOp, Const, Register, Load
+from .. import RegionIdentifier
+from ..condition_processor import ConditionProcessor
+from ..goto_manager import GotoManager
+from ..structuring import RecursiveStructurer, PhoenixStructurer
 
 from angr.utils.graph import GraphUtils
 from ..utils import first_nonlabel_statement, remove_last_statement
@@ -139,7 +145,7 @@ class LoweredSwitchSimplifier(OptimizationPass):
         "AMD64",
     ]
     PLATFORMS = ["linux", "windows"]
-    STAGE = OptimizationPassStage.BEFORE_REGION_IDENTIFICATION
+    STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Convert lowered switch-cases (if-else) to switch-cases"
     DESCRIPTION = (
         "Convert lowered switch-cases (if-else) to switch-cases. Only works when the Phoenix structuring "
@@ -151,18 +157,28 @@ class LoweredSwitchSimplifier(OptimizationPass):
         super().__init__(
             func, blocks_by_addr=blocks_by_addr, blocks_by_addr_and_idx=blocks_by_addr_and_idx, graph=graph, **kwargs
         )
+        self.goto_manager: Optional[GotoManager] = None
         self.analyze()
 
     def _check(self):
-        # TODO: More filtering
         return True, None
 
     def _analyze(self, cache=None):
+        # graph must have some valid gotos
+        graph_copy = networkx.DiGraph(self._graph)
+        initial_gotos = self._structure_and_find_gotos(graph_copy)
+        if not initial_gotos:
+            # two possibilities:
+            # 1. structuring failed, so we should exit early
+            # 2. this functions has no gotos, no need to try
+            return
+
         variablehash_to_cases = self._find_cascading_switch_variable_comparisons()
 
         if not variablehash_to_cases:
             return
 
+        # reset the copy
         graph_copy = networkx.DiGraph(self._graph)
         self.out_graph = graph_copy
         node_to_heads = defaultdict(set)
@@ -276,6 +292,14 @@ class LoweredSwitchSimplifier(OptimizationPass):
                             graph_copy.add_edge(node_copy, node_copy)
                         else:
                             graph_copy.add_edge(node_copy, succ)
+
+        # find gotos after doing work!
+        new_gotos = self._structure_and_find_gotos(self.out_graph)
+        if new_gotos is None or len(new_gotos) > len(initial_gotos):
+            # two cases:
+            # 1. structuring failed after these edits (is None)
+            # 2. we made more gotos then we initially had!
+            self.out_graph = None
 
     def _find_cascading_switch_variable_comparisons(self):
         sorted_nodes = GraphUtils.quasi_topological_sort_nodes(self._graph)
@@ -742,6 +766,32 @@ class LoweredSwitchSimplifier(OptimizationPass):
 
         # all good - remove the last statement in node
         remove_last_statement(node)
+    #
+    # taken from deduplicator
+    #
+
+    def _structure_and_find_gotos(self, graph):
+        # reset gotos
+        self.goto_manager = None
+
+        # do structuring
+        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=graph, cond_proc=ConditionProcessor(self.project.arch), force_loop_single_exit=False,
+            complete_successors=True
+        )
+        rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
+            copy.deepcopy(self.ri.region),
+            cond_proc=self.ri.cond_proc,
+            func=self._func,
+            structurer_cls=PhoenixStructurer
+        )
+        if not rs.result.nodes:
+            _l.critical(f"Failed to redo structuring...")
+            return None
+
+        rs = self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
+        self.goto_manager = rs.goto_manager
+        return self.goto_manager.gotos if self.goto_manager else None
 
     @staticmethod
     def cases_issubset(cases_0: List[Case], cases_1: List[Case]) -> bool:

@@ -1,23 +1,41 @@
-from typing import Any, Tuple, Dict, List, TYPE_CHECKING
+from typing import Any, Tuple, Dict, List, TYPE_CHECKING, Optional
 from itertools import count
 import copy
 import logging
 import inspect
 
 import networkx
+import networkx as nx
 
+import ailment
 from ailment.statement import Jump, ConditionalJump
 from ailment.expression import Const
+from ..goto_manager import GotoManager
+from .. import RegionIdentifier
+from ailment.block_walker import AILBlockWalkerBase
 
 from ..condition_processor import ConditionProcessor, EmptyBlockNotice
-from ..call_counter import AILCallCounter
 from .optimization_pass import OptimizationPass, OptimizationPassStage
+from ..structuring import RecursiveStructurer, PhoenixStructurer
 
 if TYPE_CHECKING:
     from ailment import Block
+    from ailment.statement import Call
 
 
 _l = logging.getLogger(name=__name__)
+
+
+class AILCallCounter(AILBlockWalkerBase):
+    """
+    Helper class to count AIL Calls in a block
+    """
+
+    calls = 0
+
+    def _handle_Call(self, stmt_idx: int, stmt: "Call", block: Optional["Block"]):
+        self.calls += 1
+        super()._handle_Call(stmt_idx, stmt, block)
 
 
 class EagerReturnsSimplifier(OptimizationPass):
@@ -37,9 +55,16 @@ class EagerReturnsSimplifier(OptimizationPass):
                             same hash.
     """
 
-    ARCHES = None
-    PLATFORMS = None
-    STAGE = OptimizationPassStage.AFTER_AIL_GRAPH_CREATION
+    # TODO: This optimization pass may support more architectures and platforms
+    ARCHES = [
+        "X86",
+        "AMD64",
+        "ARMCortexM",
+        "ARMHF",
+        "ARMEL",
+    ]
+    PLATFORMS = ["cgc", "linux"]
+    STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Duplicate return blocks to reduce goto statements"
     DESCRIPTION = inspect.cleandoc(__doc__[: __doc__.index(":ivar")])  # pylint:disable=unsubscriptable-object
 
@@ -52,10 +77,12 @@ class EagerReturnsSimplifier(OptimizationPass):
         # internal parameters that should be used by Clinic
         node_idx_start=0,
         # settings
-        max_level=2,
+        max_level=10,
         min_indegree=2,
         max_calls_in_regions=2,
         reaching_definitions=None,
+        region_identifier=None,
+        max_level_goto_check=2,
         **kwargs,
     ):
         super().__init__(
@@ -64,10 +91,17 @@ class EagerReturnsSimplifier(OptimizationPass):
 
         self.max_level = max_level
         self.min_indegree = min_indegree
+        self.max_level_goto_check = max_level_goto_check
         self.node_idx = count(start=node_idx_start)
         self._rd = reaching_definitions
         self.max_calls_in_region = max_calls_in_regions
+        self.ri = region_identifier
 
+        self.goto_manager: Optional[GotoManager] = None
+        self.func_name = self._func.name
+        self.binary_name = self.project.loader.main_object.binary_basename
+        self.target_name = f"{self.binary_name}.{self.func_name}"
+        self.graph_copy = None
         self.analyze()
 
     def _check(self):
@@ -82,19 +116,101 @@ class EagerReturnsSimplifier(OptimizationPass):
     def _analyze(self, cache=None):
         # for each block with no successors and more than 1 predecessors, make copies of this block and link it back to
         # the sources of incoming edges
-        graph_copy = networkx.DiGraph(self._graph)
+        self.graph_copy = networkx.DiGraph(self._graph)
+        self.last_graph = None
         graph_updated = False
 
         # attempt at most N levels
         for _ in range(self.max_level):
-            r = self._analyze_core(graph_copy)
+            success, graph_has_gotos = self._structure_graph()
+            if not success:
+                self.graph_copy = self.last_graph
+                break
+
+            if not graph_has_gotos:
+                _l.debug("Graph has no gotos. Leaving analysis...")
+                break
+
+            # make a clone of graph copy to recover in the event of failure
+            self.last_graph = self.graph_copy.copy()
+            r = self._analyze_core(self.graph_copy)
             if not r:
                 break
             graph_updated = True
 
         # the output graph
-        if graph_updated:
-            self.out_graph = graph_copy
+        if graph_updated and self.graph_copy is not None:
+            self.out_graph = self.graph_copy
+
+    #
+    # taken from deduplicator
+    #
+
+    def _structure_graph(self):
+        # reset gotos
+        self.goto_manager = None
+
+        # do structuring
+        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=self.graph_copy, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+            complete_successors=True
+        )
+        rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
+            copy.deepcopy(self.ri.region),
+            cond_proc=self.ri.cond_proc,
+            func=self._func,
+            structurer_cls=PhoenixStructurer
+        )
+        if not rs.result.nodes:
+            _l.critical(f"Failed to redo structuring on {self.target_name}")
+            return False, False
+
+        rs = self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
+        self.goto_manager = rs.goto_manager
+        return True, len(self.goto_manager.gotos) != 0
+
+    def _block_has_goto_edge(self, block: ailment.Block, graph=None):
+        # case1:
+        # A -> (goto) -> B.
+        # if goto edge coming from end block, from any instruction in the block
+        # since instructions can shift...
+        if self.goto_manager.gotos_in_block(block):
+            return True
+
+        # case2:
+        # A.last (conditional) -> (goto) -> B -> C
+        #
+        # Some condition ends in a goto to one of the ends of the merge graph. In this case,
+        # we consider it a modified version of case2
+        elif graph:
+            for pred in graph.predecessors(block):
+                last_stmt = pred.statements[-1]
+                if isinstance(last_stmt, ConditionalJump) and last_stmt.ins_addr in self.goto_manager.gotos_by_addr():
+                    """
+                    goto: Goto = self.goto_locations[last_stmt.ins_addr]
+                    if goto.target_addr in (block.addr, block.statements[0].ins_addr):
+                        return True
+                    """
+                    return True
+
+        return False
+
+    def _preds_have_goto(self, block, graph: nx.DiGraph, max_level_up=2):
+        all_blocks = [block]
+        level_blocks = [block]
+        for _ in range(max_level_up):
+            new_level_blocks = []
+            for lblock in level_blocks:
+                new_level_blocks += list(graph.predecessors(lblock))
+
+            all_blocks += new_level_blocks
+            level_blocks = new_level_blocks
+
+        for ablock in all_blocks:
+            if self._block_has_goto_edge(ablock):
+                return True
+
+        return False
 
     def _analyze_core(self, graph: networkx.DiGraph):
         endnodes = [node for node in graph.nodes() if graph.out_degree[node] == 0]
@@ -147,6 +263,17 @@ class EagerReturnsSimplifier(OptimizationPass):
             to_update[region_head] = in_edges, region
 
         for region_head, (in_edges, region) in to_update.items():
+            has_goto_edge = True
+            for in_edge in in_edges:
+                pred_node = in_edge[0]
+                if self._preds_have_goto(pred_node, graph, max_level_up=self.max_level_goto_check):
+                    break
+            else:
+                has_goto_edge = False
+
+            if not has_goto_edge:
+                continue
+
             # update the graph
             for in_edge in in_edges:
                 pred_node = in_edge[0]
@@ -163,31 +290,20 @@ class EagerReturnsSimplifier(OptimizationPass):
                         node_copy.idx = next(self.node_idx)
                         copies[node] = node_copy
 
-                    # modify Jump.target_idx and ConditionalJump.{true,false}_target_idx accordingly
+                    # modify Jump.target_idx accordingly
                     graph.add_edge(pred, node_copy)
                     try:
                         last_stmt = ConditionProcessor.get_last_statement(pred)
-                        if isinstance(last_stmt, Jump):
-                            if isinstance(last_stmt.target, Const) and last_stmt.target.value == node_copy.addr:
+                        if isinstance(last_stmt, Jump) and isinstance(last_stmt.target, Const):
+                            if last_stmt.target.value == node_copy.addr:
                                 last_stmt.target_idx = node_copy.idx
-                        elif isinstance(last_stmt, ConditionalJump):
-                            if (
-                                isinstance(last_stmt.true_target, Const)
-                                and last_stmt.true_target.value == node_copy.addr
-                            ):
-                                last_stmt.true_target_idx = node_copy.idx
-                            elif (
-                                isinstance(last_stmt.false_target, Const)
-                                and last_stmt.false_target.value == node_copy.addr
-                            ):
-                                last_stmt.false_target_idx = node_copy.idx
                     except EmptyBlockNotice:
                         pass
 
                     for succ in region.successors(node):
                         queue.append((node_copy, succ))
 
-            # remove all in-edges
+            # remove all in-edges that are now duplicated
             graph.remove_edges_from(in_edges)
             # remove the node to be copied
             graph.remove_nodes_from(region)

@@ -18,6 +18,9 @@ from .const_derefs import ConstantDereferencesSimplifier
 from .register_save_area_simplifier import RegisterSaveAreaSimplifier
 from .ret_addr_save_simplifier import RetAddrSaveSimplifier
 from .x86_gcc_getpc_simplifier import X86GccGetPcSimplifier
+from .duplication_reverter import DuplicationOptReverter
+from .const_prop_reverter import ConstPropOptReverter
+from .cross_jump_reverter import CrossJumpReverter
 from .flip_boolean_cmp import FlipBooleanCmp
 from .ret_deduplicator import ReturnDeduplicator
 from .win_stack_canary_simplifier import WinStackCanarySimplifier
@@ -35,11 +38,14 @@ _all_optimization_passes = [
     (RetAddrSaveSimplifier, True),
     (X86GccGetPcSimplifier, True),
     (ITERegionConverter, True),
-    (ReturnDeduplicator, True),
-    (LoweredSwitchSimplifier, False),
-    (EagerReturnsSimplifier, True),
     (ITEExprConverter, True),
+    (ReturnDeduplicator, True),
     (ExprOpSwapper, True),
+    (ConstPropOptReverter, True),
+    (DuplicationOptReverter, True),
+    (EagerReturnsSimplifier, True),
+    (LoweredSwitchSimplifier, True),
+    (CrossJumpReverter, True),
     (FlipBooleanCmp, True),
 ]
 
