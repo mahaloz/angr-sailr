@@ -15,7 +15,16 @@ from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Labe
 from ailment.expression import Const, Register, Convert
 import claripy
 
+from angr.knowledge_plugins.key_definitions.atoms import (
+    Atom,
+    MemoryLocation,
+    Register,
+    SpOffset,
+    ConstantSrc
+)
+
 from .optimization_pass import OptimizationPass, OptimizationPassStage
+from ..ailblock_io_finder import AILBlockIOFinder
 from ..condition_processor import ConditionProcessor
 from ..goto_manager import GotoManager, Goto
 from ..region_identifier import RegionIdentifier, GraphRegion, MultiNode
@@ -26,7 +35,7 @@ from ... import AnalysesHub
 from ....utils.graph import dominates
 
 l = logging.getLogger(name=__name__)
-_DEBUG = True
+_DEBUG = False
 l.setLevel(logging.DEBUG)
 
 
@@ -888,7 +897,7 @@ def _kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=True):
             yield start_pos
 
 
-def stmts_pos_in_other(stmts, other, graph=None):
+def stmts_pos_in_other(stmts, other, graph=None, all_positions=False):
     """
     Equivalent to asking:
     stmts in other
@@ -900,11 +909,10 @@ def stmts_pos_in_other(stmts, other, graph=None):
     if len(positions) == 0:
         return None
 
-    top_pos = positions.pop()
-    return top_pos
+    return positions.pop() if not all_positions else positions
 
 
-def stmt_in_other(stmts, other, graph=None):
+def stmts_in_other(stmts, other, graph=None):
     """
     Returns True if the stmts (a list of Statement) is found as a subsequence in other
 
@@ -936,7 +944,7 @@ def longest_ail_subseq(stmts_list, graph=None):
         for i in range(len(stmts_list[0])):
             for j in range(len(stmts_list[0]) - i + 1):
                 if j > len(subseq) and all(
-                        stmt_in_other(stmts_list[0][i:i + j], stmts, graph=graph) for stmts in stmts_list):
+                        stmts_in_other(stmts_list[0][i:i + j], stmts, graph=graph) for stmts in stmts_list):
                     subseq = stmts_list[0][i:i + j]
 
     if not subseq:
@@ -1230,7 +1238,10 @@ class DuplicationOptReverter(OptimizationPass):
                 self.out_graph = None
             else:
                 # always save the graph (and add labels) if we have a graph
-                self.out_graph = add_labels(remove_useless_gotos(self.out_graph))
+                #self.out_graph = add_labels(remove_useless_gotos(self.out_graph))
+                #self.out_graph = add_labels(self.out_graph)
+                self.out_graph = remove_useless_gotos(self.out_graph)
+
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
@@ -1341,10 +1352,10 @@ class DuplicationOptReverter(OptimizationPass):
         candidate = sorted(candidates.pop(), key=lambda x: x.addr)
         l.info(f"Selecting the candidate: {candidate}")
 
-        ail_merge_graph = self.create_merged_subgraph(candidate, self.read_graph)
+        ail_merge_graph = self.create_merged_subgraph(candidate, self.write_graph)
         candidate = ail_merge_graph.starts
         for block in ail_merge_graph.original_ends:
-            if self._block_has_goto_edge(block, [b for b in ail_merge_graph.original_ends if b is not block], graph=self.read_graph):
+            if self._block_has_goto_edge(block, [b for b in ail_merge_graph.original_ends if b is not block], graph=self.write_graph):
                 break
         else:
             self.candidate_blacklist.add(tuple(candidate))
@@ -1507,11 +1518,11 @@ class DuplicationOptReverter(OptimizationPass):
 
         return False, True
 
-    def _construct_best_condition_block_for_merge(self, blocks) -> Tuple[Block, Block]:
+    def _construct_best_condition_block_for_merge(self, blocks, graph) -> Tuple[Block, Block]:
         # find the conditions that block both of these blocks
-        common_cond = shared_common_conditional_dom(blocks, self.read_graph)
+        common_cond = shared_common_conditional_dom(blocks, graph)
         conditions_by_start = self.collect_conditions_between_nodes(
-            self.read_graph,
+            graph,
             common_cond,
             blocks
         )
@@ -1547,7 +1558,139 @@ class DuplicationOptReverter(OptimizationPass):
 
         return cond_block, true_block
 
+    @staticmethod
+    def _input_defined_by_other_stmt(target_idx, other_idx, io_finder):
+        target_inputs = io_finder.inputs_by_stmt[target_idx]
+        # any memory location, not on stack, is not movable
+        if any(isinstance(i, MemoryLocation) and not i.is_on_stack for i in target_inputs):
+            return True
+
+        other_outputs = io_finder.outputs_by_stmt[other_idx]
+        return target_inputs.intersection(other_outputs)
+
+    @staticmethod
+    def _output_used_by_other_stmt(target_idx, other_idx, io_finder):
+        target_output = io_finder.outputs_by_stmt[target_idx]
+        # any memory location, not on stack, is not movable
+        if any(isinstance(o, MemoryLocation) and not o.is_on_stack for o in target_output):
+            return True
+
+        other_input = io_finder.inputs_by_stmt[other_idx]
+        return target_output.intersection(other_input)
+
+    def stmt_can_move_to(self, stmt, block, new_idx, io_finder=None):
+        if stmt not in block.statements:
+            raise NotImplementedError("Statement not in block, and we can't compute moving a stmt to a new block!")
+
+        # jumps of any kind are not moveable
+        if (new_idx == len(block.statements) - 1 and isinstance(block.statements[new_idx], (ConditionalJump, Jump))) \
+                or isinstance(stmt, (ConditionalJump, Jump)):
+            return False
+
+        io_finder = io_finder or AILBlockIOFinder(block, self.project)
+        curr_idx = block.statements.index(stmt)
+        move_up = new_idx < curr_idx
+
+        # moving a statement up in the statements:
+        # we must check if it's defined by anything above it (lower in index)
+        can_move = True
+        if move_up:
+            # exclude curr_idx in range
+            for mid_idx in range(new_idx, curr_idx):
+                if self._input_defined_by_other_stmt(curr_idx, mid_idx, io_finder):
+                    can_move = False
+                    break
+
+        # moving a statement down in the statements:
+        # we much check if it's used by anything below it (greater in index)
+        else:
+            for mid_idx in range(curr_idx+1, new_idx+1):
+                if self._output_used_by_other_stmt(curr_idx, mid_idx, io_finder):
+                    can_move = False
+                    break
+
+        return can_move
+
+    def maximize_similarity_of_blocks(self, block1, block2, graph) -> Tuple[Block, Block]:
+        new_block1, new_block2 = block1.copy(), block2.copy()
+
+        updates = True
+        prev_moved = set()
+        while updates:
+            updates = False
+            lcs, lcs_idxs = longest_ail_subseq([new_block1.statements, new_block2.statements])
+            lcs_idx_by_block = {new_block1: lcs_idxs[0], new_block2: lcs_idxs[1]}
+            if any(v is None for v in lcs_idx_by_block.values()):
+                break
+
+            io_finder_by_block = {
+                new_block1: AILBlockIOFinder(new_block1, self.project),
+                new_block2: AILBlockIOFinder(new_block2, self.project)
+            }
+
+            for search_offset in (-1, 1):
+                for b1, b2 in itertools.permutations([new_block1, new_block2], 2):
+                    if lcs_idx_by_block[b1] + search_offset < 0 or lcs_idx_by_block[b1] + search_offset >= len(b1.statements):
+                        continue
+
+                    b1_unmatched = b1.statements[lcs_idx_by_block[b1] + search_offset]
+                    if b1_unmatched in prev_moved:
+                        continue
+
+                    unmatched_b2_positions = stmts_pos_in_other([b1_unmatched], b2.statements, all_positions=True)
+                    if unmatched_b2_positions is None:
+                        continue
+
+                    # b1_unmatched must be in b2
+                    for b2_pos in unmatched_b2_positions:
+                        b2_stmt = b2.statements[b2_pos]
+                        if b2_stmt in prev_moved:
+                            continue
+
+                        if b2_pos + search_offset < 0 or b2_pos + search_offset >= len(b2.statements):
+                            continue
+
+                        # a stmt must be independent to be moveable
+                        if self.stmt_can_move_to(b2_stmt, b2, lcs_idx_by_block[b2] + search_offset, io_finder=io_finder_by_block[b2]):
+                            #prev_stmts = b2.statements.copy()
+                            b2.statements.remove(b2_stmt)
+                            b2.statements.insert(lcs_idx_by_block[b2] + search_offset, b2_stmt)
+                            prev_moved.add(b2_stmt)
+                            prev_moved.add(b1_unmatched)
+
+                            #new_lcs, _ = longest_ail_subseq([b1.statements, b2.statements])
+                            ## if changes make don't make the lcs longer, revert changes
+                            #if len(lcs) >= len(new_lcs):
+                            #    b2.statements = prev_stmts
+                            updates = True
+                            break
+
+                    if updates:
+                        break
+                if updates:
+                    break
+            else:
+                # no updates happen, we are ready to kill this search
+                break
+
+        graph_changed = False
+        if new_block1.statements != block1.statements:
+            replace_node_in_graph(graph, block1, new_block1)
+            graph_changed = True
+
+        if new_block2.statements != block2.statements:
+            replace_node_in_graph(graph, block2, new_block2)
+            graph_changed = True
+
+        if graph_changed:
+            return new_block1, new_block2
+
+        return block1, block2
+
     def create_merged_subgraph(self, blocks, graph: nx.DiGraph) -> AILMergeGraph:
+        # Before creating a full graph LCS, optimize the common seq between the starting blocks
+        blocks = list(self.maximize_similarity_of_blocks(blocks[0], blocks[1], graph))
+
         # Traverse both blocks subgraphs within the original graph and find the longest common AIL sequence.
         # Use one of the blocks subraphs to construct the top-half of the new merged graph that contains no inserted
         # conditions yet. This means the graph is still missing the divergence of the two graphs.
@@ -1555,7 +1698,6 @@ class DuplicationOptReverter(OptimizationPass):
         ail_merge_graph = AILMergeGraph(original_graph=graph)
         # some blocks in originals may update during this time (if-statements can change)
         update_blocks = ail_merge_graph.create_conditionless_graph(blocks, graph_lcs)
-        merge_base, other_base = ail_merge_graph.starts[:]
 
         #
         # SPECIAL CASE: the merged graph contains only 1 node and no splits
@@ -1566,7 +1708,7 @@ class DuplicationOptReverter(OptimizationPass):
             new_node = list(ail_merge_graph.graph.nodes)[0]
             base_successor = list(graph.successors(blocks[0]))[0]
             other_successor = list(graph.successors(blocks[1]))[0]
-            conditional_block, true_target = self._construct_best_condition_block_for_merge(blocks)
+            conditional_block, true_target = self._construct_best_condition_block_for_merge(blocks, graph)
             if true_target == blocks[0]:
                 conditional_block.statements[-1].true_target.value = base_successor.addr
                 conditional_block.statements[-1].false_target.value = other_successor.addr
@@ -1584,7 +1726,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         # collect the conditions
         # make a new conditional block
-        conditional_block, true_target = self._construct_best_condition_block_for_merge(blocks)
+        conditional_block, true_target = self._construct_best_condition_block_for_merge(blocks, graph)
         true_target = ail_merge_graph.starts[0] if true_target is blocks[0] else ail_merge_graph.starts[1]
         ail_merge_graph.add_edges_to_condition(conditional_block, true_target, merge_end_pairs)
 
