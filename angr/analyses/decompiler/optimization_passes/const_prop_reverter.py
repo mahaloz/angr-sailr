@@ -12,7 +12,7 @@ from typing import Dict, Type, Callable
 
 import networkx as nx
 import itertools
-from ..ailblock_walker import AILBlockWalkerBase
+from ailment.block_walker import AILBlockWalkerBase
 from ailment.statement import Call, Statement, ConditionalJump, Assignment, Store, Return
 
 from ... import AnalysesHub

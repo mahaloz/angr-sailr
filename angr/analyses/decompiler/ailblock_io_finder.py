@@ -26,7 +26,7 @@ from angr.knowledge_plugins.key_definitions.atoms import (
     ConstantSrc
 )
 
-from .ailblock_walker import AILBlockWalkerBase
+from ailment.block_walker import AILBlockWalkerBase
 
 
 class AILBlockIOFinder(AILBlockWalkerBase):
