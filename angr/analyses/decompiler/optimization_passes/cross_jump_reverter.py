@@ -12,6 +12,8 @@ import ailment
 from ailment.statement import Jump, ConditionalJump
 from ailment.expression import Const
 from .. import RegionIdentifier
+from ..utils import to_ail_supergraph, remove_labels
+from .duplication_reverter import add_labels
 
 from ..condition_processor import ConditionProcessor, EmptyBlockNotice
 from .optimization_pass import OptimizationPass, OptimizationPassStage
@@ -82,7 +84,8 @@ class CrossJumpReverter(OptimizationPass):
     def _analyze(self, cache=None):
         # for each block with no successors and more than 1 predecessors, make copies of this block and link it back to
         # the sources of incoming edges
-        self.graph_copy = to_ail_supergraph(networkx.DiGraph(self._graph))
+        self.graph_copy = to_ail_supergraph(remove_labels(networkx.DiGraph(self._graph)))
+        #self.graph_copy = to_ail_supergraph(networkx.DiGraph(self._graph))
         self.last_graph = None
         graph_updated = False
 
@@ -107,7 +110,9 @@ class CrossJumpReverter(OptimizationPass):
         # the output graph
         if graph_updated and self.graph_copy is not None:
             if self.goto_manager is not None and not (len(self.initial_gotos) < len(self.goto_manager.gotos)):
-                self.out_graph = self.graph_copy
+                #self.out_graph = self.graph_copy
+                #self.out_graph = add_labels(remove_labels(self.graph_copy))
+                self.out_graph = add_labels(self.graph_copy)
 
 
     #
@@ -119,6 +124,8 @@ class CrossJumpReverter(OptimizationPass):
         self.goto_manager = None
 
         # do structuring
+        #breakpoint()
+        self.graph_copy = add_labels(self.graph_copy)
         self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
             self._func, graph=self.graph_copy, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
             complete_successors=True
@@ -129,6 +136,7 @@ class CrossJumpReverter(OptimizationPass):
             func=self._func,
             structurer_cls=PhoenixStructurer
         )
+        self.graph_copy = remove_labels(self.graph_copy)
         if not rs.result.nodes:
             l.critical(f"Failed to redo structuring on {self.target_name}")
             return False, False

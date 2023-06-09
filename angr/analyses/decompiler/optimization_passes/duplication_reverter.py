@@ -1230,17 +1230,16 @@ class DuplicationOptReverter(OptimizationPass):
                 self.out_graph = None
 
         if self.out_graph is not None:
-            if stop_if_more_goto and \
-                    self._starting_goto_count < len(self.goto_manager.gotos) and \
-                    self._starting_goto_count < len(self._non_reducible_gotos()):
-                l.info(f"SAILR generated more gotos then it started with {self._starting_goto_count} -> "
-                       f"{len(self.goto_manager.gotos)}. Reverting back to before SAILR...")
-                self.out_graph = None
-            else:
-                # always save the graph (and add labels) if we have a graph
-                #self.out_graph = add_labels(remove_useless_gotos(self.out_graph))
-                #self.out_graph = add_labels(self.out_graph)
-                self.out_graph = remove_useless_gotos(self.out_graph)
+            output_graph = True
+            if stop_if_more_goto:
+                future_irreducible_gotos = self._find_future_irreducible_gotos()
+                targetable_goto_cnt = len(self.goto_manager.gotos) - len(future_irreducible_gotos)
+                if targetable_goto_cnt > self._starting_goto_count:
+                    l.info(f"{self.__class__.__name__} generated >= gotos then it started with "
+                           f"{self._starting_goto_count} -> {targetable_goto_cnt}. Reverting...")
+                    output_graph = False
+
+            self.out_graph = add_labels(remove_useless_gotos(self.out_graph)) if output_graph else None
 
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
@@ -1871,7 +1870,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         return False
 
-    def _non_reducible_gotos(self, max_endpoint_distance=5):
+    def _find_future_irreducible_gotos(self, max_endpoint_distance=5):
         """
         Checks if these gotos could be fixed by eager returns
         """
@@ -1893,10 +1892,10 @@ class DuplicationOptReverter(OptimizationPass):
 
             connects_endnode = False
             for endnode in endnodes:
-                if nx.has_path(self.write_graph, goto_end_block, endnode):
+                if goto_end_block in self.out_graph and endnode in self.out_graph and nx.has_path(self.out_graph, goto_end_block, endnode):
                     try:
                         next(
-                            nx.all_simple_paths(self.write_graph, goto_end_block, endnode, cutoff=max_endpoint_distance)
+                            nx.all_simple_paths(self.out_graph, goto_end_block, endnode, cutoff=max_endpoint_distance)
                         )
                     except StopIteration:
                         continue

@@ -9,6 +9,8 @@ from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ....knowledge_plugins.key_definitions.atoms import MemoryLocation
 from typing import Dict, Type, Callable
+from ..utils import to_ail_supergraph, remove_labels
+from .duplication_reverter import add_labels
 
 import networkx as nx
 import itertools
@@ -143,7 +145,8 @@ class ConstPropOptReverter(OptimizationPass):
 
     def _analyze(self, cache=None):
         self.resolution = False
-        self.out_graph = self._graph
+        self.out_graph = remove_labels(self._graph)
+        #self.out_graph = self._graph
 
         _pair_stmt_handlers = {
             Call: self._handle_Call_pair,
@@ -157,6 +160,9 @@ class ConstPropOptReverter(OptimizationPass):
 
         if not self.resolution:
             self.out_graph = None
+        else:
+            self.out_graph = add_labels(self.out_graph)
+
 
     #
     # Handle Similar Calls
