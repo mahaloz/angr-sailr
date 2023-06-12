@@ -35,7 +35,7 @@ from ... import AnalysesHub
 from ....utils.graph import dominates
 
 l = logging.getLogger(name=__name__)
-_DEBUG = False
+_DEBUG = True
 l.setLevel(logging.DEBUG)
 
 
@@ -80,7 +80,11 @@ class AILMergeGraph:
         self.original_ends = list()
 
     def create_conditionless_graph(self, starting_blocks: List[Block], graph_lcs):
-        # get all the original blocks (reverted from the LCS) and their split blocks
+        # get all the original blocks (reverted from the LCS) and their split blocks.
+        # split-blocks are blocks that need to be split at some stmt index to make the two blocks
+        # equal across both graphs. At a highlevel, the first block in both matching graphs either need
+        # to be a full match or a spilt block with a None up-split (since the up-split represent a starting
+        # stmt that mismatches).
         self.starts = starting_blocks.copy()
         merge_base, other_base = self.starts[:]
         for block in self.starts:
@@ -89,6 +93,7 @@ class AILMergeGraph:
             self.original_split_blocks[block] = [
                 AILBlockSplit.from_block_lcs(og, idx, len(lcs)) for og, (lcs, idx) in split_blks.items()
             ]
+
         # eliminate shared blocks that are the same in original blocks
         shared_blocks = set(self.original_blocks[merge_base]).intersection(
             set(self.original_blocks[other_base])
@@ -103,10 +108,10 @@ class AILMergeGraph:
                     self.original_split_blocks[block].remove(shared_block)
 
         # we now know all the original blocks that will be merged, in order of BFS
-        # so let's create the graph that will be the final output self
+        # so let's create the graph that will be the final output merged graph
         #
-        # we start by finding all the blocks that are about to be split, i.e., not
-        # all of the block statements matches
+        # we start by finding all the blocks that are about to be split, i.e., blocks that
+        # have at least one stmt mismatching from each other
         base_to_split = {
             split_block.original: split_block.match_split
             for split_block in self.original_split_blocks[merge_base]

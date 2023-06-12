@@ -183,7 +183,7 @@ class AILBlockIOFinder(AILBlockWalkerBase):
 
     def _handle_Const(self, expr_idx: int, expr: Const, stmt_idx: int, stmt: Statement, block: Optional[Block], is_memory=False):
         if self._as_atom:
-            return MemoryLocation(expr.value, expr.size) if is_memory else ConstantSrc(expr.value)
+            return MemoryLocation(expr.value, expr.size) if is_memory else ConstantSrc(expr.value, expr.size)
 
         return (expr, is_memory, )
 
