@@ -742,6 +742,9 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
     if type(ail_obj1) is not type(ail_obj2):
         return False
 
+    if ail_obj1 is ail_obj2:
+        return True
+
     # AIL Blocks
     if isinstance(ail_obj1, Block):
         if len(ail_obj1.statements) != len(ail_obj2.statements):
@@ -755,6 +758,9 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
 
     # AIL Statements
     elif isinstance(ail_obj1, Statement):
+        #if all(barr in [0x404530, 0x404573] for barr in [ail_obj1.ins_addr, ail_obj2.ins_addr]):
+        #    breakpoint()
+
         # ConditionalJump Handler
         if isinstance(ail_obj1, ConditionalJump):
             # try a simple compare
@@ -964,7 +970,7 @@ def longest_ail_graph_subseq(block_list, graph):
         ail_graph_similarity(pair[0], pair[1], graph) for pair in itertools.combinations(block_list, 2)
     ]
 
-    lcs, _ = longest_ail_subseq(all_sims, graph)
+    lcs, _ = longest_ail_subseq(all_sims, graph=graph)
     return lcs
 
 
@@ -973,7 +979,6 @@ def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_b
     b1_blocks = bfs_list_blocks(block1, graph)
     similarity = list()
 
-    block_splits = {b: list() for b in [block0, block1]}
     discontinuity_blocks = set()
     for i, b0 in enumerate(b0_blocks):
         # getting to a block with no matching index is grounds to stop cmp
@@ -1018,7 +1023,6 @@ def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_b
             if all_match and len(list(graph.successors(b0))) != 0:
                 continue
 
-        # find the common statements of the two
         lcs, lcs_idxs = longest_ail_subseq([b0.statements, b1.statements], graph=graph)
         if not lcs:
             break
@@ -2130,7 +2134,7 @@ class DuplicationOptReverter(OptimizationPass):
 
                 for stmt1 in b1.statements:
                     # XXX: used to be just likes()
-                    if similar(stmt0, stmt1, self.write_graph):
+                    if similar(stmt0, stmt1, graph=self.write_graph):
                         stmt_in_common = True
                         break
 
