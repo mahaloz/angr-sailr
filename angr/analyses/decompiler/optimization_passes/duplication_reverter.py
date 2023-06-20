@@ -10,9 +10,10 @@ import networkx
 import networkx as nx
 
 import ailment
+from ailment import AILBlockWalkerBase
 from ailment.block import Block
 from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Label
-from ailment.expression import Const, Register, Convert
+from ailment.expression import Const, Register, Convert, BinaryOp, Expression
 import claripy
 
 from angr.knowledge_plugins.key_definitions.atoms import (
@@ -49,6 +50,50 @@ class StructuringError(Exception):
 
 class SAILRSemanticError(Exception):
     pass
+
+
+class ConditionBooleanWalker(AILBlockWalkerBase):
+    """
+    This class counts the number of Boolean operators an expression has.
+    In the case of: `if (a || (b && c))`, it will count 2 Boolean operators.
+
+    TODO: this entire boolean checking semantic we use needs to be removed, see how it is used for other dels needed
+    we need to replace it with a boolean variable insertion on both branches that lead to the new block
+    say we have:
+    if (A()) {
+        do_thing();
+    }
+    if (B()) {
+        do_thing():
+    }
+
+    We want to translate it to:
+    int should_do_thing = 0;
+    if (A())
+        should_do_thing = 1;
+    if (B())
+        should_do_thing = 1;
+
+    if (should_do_thing):
+        do_thing();
+
+    Although longer, this code can be optimized to look like:
+    int should_do_thing = A() || B();
+    if (should_do_thing)
+        do_thing();
+    """
+    def __init__(self):
+        super().__init__()
+        self.boolean_cnt = 0
+
+    def _handle_BinaryOp(
+        self, expr_idx: int, expr: "BinaryOp", stmt_idx: int, stmt: "Statement", block: Optional["Block"]
+    ):
+        if expr.op == "LogicalAnd" or expr.op == "LogicalOr":
+            self.boolean_cnt += 1
+
+        self._handle_expr(0, expr.operands[0], stmt_idx, stmt, block)
+        self._handle_expr(1, expr.operands[1], stmt_idx, stmt, block)
 
 
 class AILMergeGraph:
@@ -1189,7 +1234,7 @@ class DuplicationOptReverter(OptimizationPass):
                  func,
                  region_identifier=None,
                  reaching_definitions=None,
-                 max_guarding_conditions=15,
+                 max_guarding_conditions=4,
                  **kwargs):
         self.ri: RegionIdentifier = region_identifier
         self.rd: ReachingDefinitionsAnalysis = reaching_definitions
@@ -1228,7 +1273,6 @@ class DuplicationOptReverter(OptimizationPass):
                 self.deduplication_analysis(max_fix_attempts=30)
             except StructuringError:
                 l.critical(f"Structuring failed! This function {self.target_name} is dead in the water!")
-            return
         else:
             try:
                 self.deduplication_analysis(max_fix_attempts=30)
@@ -1545,11 +1589,12 @@ class DuplicationOptReverter(OptimizationPass):
                 continue
 
             _, best_cond = best_condition_pair
-            if condition.depth < best_cond.depth:
+            if self.boolean_operators_in_condition(condition) < self.boolean_operators_in_condition(best_cond):
                 best_condition_pair = start, condition
 
         true_block, best_condition = best_condition_pair
-        if best_condition.depth >= self.max_guarding_conditions:
+        boolean_cnt = self.boolean_operators_in_condition(best_condition)
+        if boolean_cnt >= self.max_guarding_conditions:
             self.candidate_blacklist.add(tuple(blocks))
             raise SAILRSemanticError("A condition would be too long for a fixup, this analysis must skip it")
 
@@ -1565,6 +1610,12 @@ class DuplicationOptReverter(OptimizationPass):
         cond_block.statements = [cond_jump]
 
         return cond_block, true_block
+
+    @staticmethod
+    def boolean_operators_in_condition(condition: Expression):
+        walker = ConditionBooleanWalker()
+        walker.walk_expression(condition)
+        return walker.boolean_cnt
 
     @staticmethod
     def _input_defined_by_other_stmt(target_idx, other_idx, io_finder):
