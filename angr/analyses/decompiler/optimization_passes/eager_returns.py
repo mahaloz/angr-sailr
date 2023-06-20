@@ -8,7 +8,8 @@ import networkx
 import networkx as nx
 
 import ailment
-from ailment.statement import Jump, ConditionalJump
+from ailment import Block
+from ailment.statement import Jump, ConditionalJump, Return, Label
 from ailment.expression import Const
 from ..goto_manager import GotoManager
 from .. import RegionIdentifier
@@ -263,16 +264,17 @@ class EagerReturnsSimplifier(OptimizationPass):
             to_update[region_head] = in_edges, region
 
         for region_head, (in_edges, region) in to_update.items():
-            has_goto_edge = True
-            for in_edge in in_edges:
-                pred_node = in_edge[0]
-                if self._preds_have_goto(pred_node, graph, max_level_up=self.max_level_goto_check):
-                    break
-            else:
-                has_goto_edge = False
+            if not self._is_single_return_stmt_region(region):
+                has_goto_edge = True
+                for in_edge in in_edges:
+                    pred_node = in_edge[0]
+                    if self._preds_have_goto(pred_node, graph, max_level_up=self.max_level_goto_check):
+                        break
+                else:
+                    has_goto_edge = False
 
-            if not has_goto_edge:
-                continue
+                if not has_goto_edge:
+                    continue
 
             # update the graph
             for in_edge in in_edges:
@@ -399,3 +401,18 @@ class EagerReturnsSimplifier(OptimizationPass):
                 # it's an indirect jump (assuming the AIL block is properly optimized)
                 return True
         return False
+
+    @staticmethod
+    def _is_single_return_stmt_region(region: networkx.DiGraph) -> bool:
+        """
+        Checks weather the provided region contains only one return statement. This stmt
+        can be connected by many jumps, but none can be conditional. A valid case is:
+        [Jmp] -> [Jmp] -> [Ret]
+        """
+        valid_stmt_types = (Return, Jump, Label)
+        for node in region.nodes():
+            if isinstance(node, Block):
+                for stmt in node.statements:
+                    if not isinstance(stmt, valid_stmt_types):
+                        return False
+        return True
