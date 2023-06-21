@@ -36,7 +36,7 @@ from ... import AnalysesHub
 from ....utils.graph import dominates
 
 l = logging.getLogger(name=__name__)
-_DEBUG = False
+_DEBUG = True
 l.setLevel(logging.DEBUG)
 
 
@@ -823,6 +823,21 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
                 try:
                     t1_blk, t2_blk = find_block_by_addr(graph, t1), find_block_by_addr(graph, t2)
                 except Exception:
+                    return False
+
+                # special checks for when a node is empty:
+                if not t1_blk.statements or not t2_blk.statements:
+                    # when both are empty, they are similar
+                    if len(t1_blk.statements) == len(t2_blk.statements):
+                        continue
+
+                    # TODO: implement a check for when one is empty and other is jump.
+                    # this will require a recursive call into similar() to check if a jump and empty are equal
+                    #
+                    # when one block has a jump but the other is empty, they are possibly similar
+                    #larger_blk = t1_blk if not t2_blk.statements else t2_blk
+                    #if len(larger_blk.statements) == 1 and isinstance(larger_blk.statements[-1], Jump):
+                    #    continue
                     return False
 
                 # skip full checks when partial checking is on
@@ -2131,6 +2146,10 @@ class DuplicationOptReverter(OptimizationPass):
 
             #if all([b.addr in [0x40cc9a, 0x40cdb5] for b in (b0, b1)]):
             #    breakpoint()
+
+            # blocks must have statements
+            if not b0.statements or not b1.statements:
+                continue
 
             # blocks must share a region
             if not self._share_subregion([b0, b1]):
