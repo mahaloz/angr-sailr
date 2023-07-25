@@ -36,7 +36,7 @@ from ... import AnalysesHub
 from ....utils.graph import dominates
 
 l = logging.getLogger(name=__name__)
-_DEBUG = True
+_DEBUG = False
 l.setLevel(logging.DEBUG)
 
 
