@@ -1299,7 +1299,14 @@ class DuplicationOptReverter(OptimizationPass):
 
         if self.out_graph is not None:
             output_graph = True
-            if stop_if_more_goto:
+            # if structuring failed
+            if self.goto_manager is None:
+                self.out_graph = self.prev_graph
+                self.write_graph = self.prev_graph
+                if not self._structure_graph():
+                    output_graph = False
+
+            if stop_if_more_goto and output_graph:
                 future_irreducible_gotos = self._find_future_irreducible_gotos()
                 targetable_goto_cnt = len(self.goto_manager.gotos) - len(future_irreducible_gotos)
                 if targetable_goto_cnt > self._starting_goto_count:
