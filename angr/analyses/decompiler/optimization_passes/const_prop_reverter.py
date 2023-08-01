@@ -185,6 +185,10 @@ class ConstPropOptReverter(OptimizationPass):
         l.info(f"Found two calls at ({hex(blk0.addr)}, {hex(blk1.addr)}) that are similar. "
                f"Attempting to resolve const args now...")
 
+        # destroy old ReachDefs, since we need a new one
+        self.rd = None
+        observation_points = ('node', blk0.addr, OP_BEFORE), ('node', blk1.addr, OP_BEFORE)
+
         # attempt to do constant resolution for each argument that differs
         for i, args in arg_conflicts.items():
             a0, a1 = args[:]
@@ -203,8 +207,15 @@ class ConstPropOptReverter(OptimizationPass):
             if const_arg is None or sym_arg is None:
                 continue
 
+            if self.rd is None:
+                self.rd = self.project.analyses.ReachingDefinitions(
+                    subject=self._func,
+                    observation_points=observation_points
+                )
             unwrapped_sym_arg = sym_arg.operands[0] if isinstance(sym_arg, Convert) else sym_arg
             try:
+                # TODO: make this support more than just Loads
+                # target must be a Load of a memory location
                 target_atom = MemoryLocation(unwrapped_sym_arg.addr.value, unwrapped_sym_arg.size, 'Iend_LE')
                 const_state = self.rd.get_reaching_definitions_by_node(
                     blks[calls[const_arg]].addr,
