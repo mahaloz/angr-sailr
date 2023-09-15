@@ -1,15 +1,14 @@
-from itertools import combinations
-from typing import List, Optional
+from typing import List
 import logging
 
 from ailment import Block, Const
-from ailment.expression import Convert
+from ailment.expression import Convert, Register
 import claripy
 from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ....knowledge_plugins.key_definitions.atoms import MemoryLocation
 from typing import Dict, Type, Callable
-from ..utils import to_ail_supergraph, remove_labels
+from ..utils import remove_labels
 from .duplication_reverter import add_labels
 
 import networkx as nx
@@ -34,16 +33,12 @@ class PairAILBlockWalker:
             Return: self._handle_Return_pair,
         }
 
-        self.stmt_pair_handlers: Dict[Type, Callable] = stmt_pair_handlers if stmt_pair_handlers else _default_stmt_handlers
+        self.stmt_pair_handlers: Dict[Type, Callable] = (
+            stmt_pair_handlers if stmt_pair_handlers else _default_stmt_handlers
+        )
 
     def _walk_block(self, block):
-        walked_objs = {
-            Assignment: set(),
-            Call: set(),
-            Store: set(),
-            ConditionalJump: set(),
-            Return: set()
-        }
+        walked_objs = {Assignment: set(), Call: set(), Store: set(), ConditionalJump: set(), Return: set()}
 
         # create a walker that will:
         # 1. recursively expand a stmt with the default handler then,
@@ -66,9 +61,7 @@ class PairAILBlockWalker:
         def _handle_call_expr(expr_idx: int, expr: Call, stmt_idx: int, stmt: Statement, block_):
             walked_objs[Call].add(expr)
 
-        _stmt_handlers = {
-            typ: _handle_ail_obj for typ in walked_objs
-        }
+        _stmt_handlers = {typ: _handle_ail_obj for typ in walked_objs}
         walker.stmt_handlers = _stmt_handlers
         walker.expr_handlers[Call] = _handle_call_expr
 
@@ -125,7 +118,14 @@ class ConstPropOptReverter(OptimizationPass):
     statements with a difference of a const and a symbolic variable and converting the constant
     into a symbolic variable, given that they have the same value on branches.
     """
-    ARCHES = ["X86", "AMD64", "ARMCortexM", "ARMHF", "ARMEL", ]
+
+    ARCHES = [
+        "X86",
+        "AMD64",
+        "ARMCortexM",
+        "ARMHF",
+        "ARMEL",
+    ]
     PLATFORMS = ["cgc", "linux"]
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Revert Constant Propagation Opt"
@@ -146,10 +146,11 @@ class ConstPropOptReverter(OptimizationPass):
     def _analyze(self, cache=None):
         self.resolution = False
         self.out_graph = remove_labels(self._graph)
-        #self.out_graph = self._graph
+        # self.out_graph = self._graph
 
         _pair_stmt_handlers = {
             Call: self._handle_Call_pair,
+            Return: self._handle_Return_pair,
         }
 
         if self.out_graph is None:
@@ -163,6 +164,81 @@ class ConstPropOptReverter(OptimizationPass):
         else:
             self.out_graph = add_labels(self.out_graph)
 
+    #
+    # Handle Similar Returns
+    #
+
+    def _handle_Return_pair(self, obj0: Return, blk0: Return, obj1, blk1):
+        if obj0 is obj1:
+            return
+
+        rexp0, rexp1 = obj0.ret_exprs, obj1.ret_exprs
+        if rexp0 is None or rexp1 is None or len(rexp0) != len(rexp1):
+            return
+
+        conflicts = {
+            i: ret_exprs
+            for i, ret_exprs in enumerate(zip(rexp0, rexp1))
+            if hasattr(ret_exprs[0], "likes") and not ret_exprs[0].likes(ret_exprs[1])
+        }
+        # only single expr return is supported
+        if len(conflicts) != 1:
+            return
+
+        _, ret_exprs = list(conflicts.items())[0]
+        expr_to_blk = {ret_exprs[0]: blk0, ret_exprs[1]: blk1}
+        # find the expression that is symbolic
+        symb_expr, const_expr = None, None
+        for expr in ret_exprs:
+            unpacked_expr = expr
+            if isinstance(expr, Convert):
+                unpacked_expr = expr.operands[0]
+
+            if isinstance(unpacked_expr, Const):
+                const_expr = expr
+            elif isinstance(unpacked_expr, Call):
+                const_expr = expr
+            else:
+                symb_expr = expr
+
+        if symb_expr is None or const_expr is None:
+            return
+
+        # now we do specific cases for matching
+        if (
+            isinstance(symb_expr, Register)
+            and isinstance(const_expr, Call)
+            and isinstance(const_expr.ret_expr, Register)
+        ):
+            """
+            B0:
+            return foo();   // considered constant)
+            B1:
+            return rax;     // considered symbolic
+
+            =>
+
+            B0:
+            rax = foo();
+            return rax;
+            B1:
+            return rax;
+            """
+            call_return_reg = const_expr.ret_expr
+            if symb_expr.likes(call_return_reg):
+                symb_return_stmt = expr_to_blk[symb_expr].statements[-1]
+                const_block = expr_to_blk[const_expr]
+
+                # rax = foo();
+                reg_assign = Assignment(None, symb_expr, const_expr)
+
+                # construct new constant block
+                new_const_block = const_block.copy()
+                new_const_block.statements = new_const_block.statements[:-1] + [reg_assign] + [symb_return_stmt.copy()]
+                self._update_block(const_block, new_const_block)
+                self.resolution = True
+        else:
+            l.debug("This case is not supported yet for Return depropagation")
 
     #
     # Handle Similar Calls
@@ -182,12 +258,14 @@ class ConstPropOptReverter(OptimizationPass):
         if not arg_conflicts:
             return
 
-        l.info(f"Found two calls at ({hex(blk0.addr)}, {hex(blk1.addr)}) that are similar. "
-               f"Attempting to resolve const args now...")
+        l.info(
+            f"Found two calls at ({hex(blk0.addr)}, {hex(blk1.addr)}) that are similar. "
+            f"Attempting to resolve const args now..."
+        )
 
         # destroy old ReachDefs, since we need a new one
         self.rd = None
-        observation_points = ('node', blk0.addr, OP_BEFORE), ('node', blk1.addr, OP_BEFORE)
+        observation_points = ("node", blk0.addr, OP_BEFORE), ("node", blk1.addr, OP_BEFORE)
 
         # attempt to do constant resolution for each argument that differs
         for i, args in arg_conflicts.items():
@@ -209,18 +287,14 @@ class ConstPropOptReverter(OptimizationPass):
 
             if self.rd is None:
                 self.rd = self.project.analyses.ReachingDefinitions(
-                    subject=self._func,
-                    observation_points=observation_points
+                    subject=self._func, observation_points=observation_points
                 )
             unwrapped_sym_arg = sym_arg.operands[0] if isinstance(sym_arg, Convert) else sym_arg
             try:
                 # TODO: make this support more than just Loads
                 # target must be a Load of a memory location
-                target_atom = MemoryLocation(unwrapped_sym_arg.addr.value, unwrapped_sym_arg.size, 'Iend_LE')
-                const_state = self.rd.get_reaching_definitions_by_node(
-                    blks[calls[const_arg]].addr,
-                    OP_BEFORE
-                )
+                target_atom = MemoryLocation(unwrapped_sym_arg.addr.value, unwrapped_sym_arg.size, "Iend_LE")
+                const_state = self.rd.get_reaching_definitions_by_node(blks[calls[const_arg]].addr, OP_BEFORE)
 
                 state_load_vals = const_state.get_value_from_atom(target_atom)
             except Exception:
@@ -259,12 +333,10 @@ class ConstPropOptReverter(OptimizationPass):
             return None
 
         # zip args of call 0 and 1 conflict if they are not like each other
-        conflicts = {
-            i: args for i, args in enumerate(zip(call0.args, call1.args))
-            if not args[0].likes(args[1])
-        }
+        conflicts = {i: args for i, args in enumerate(zip(call0.args, call1.args)) if not args[0].likes(args[1])}
 
         return conflicts
+
     #
     # other handlers
     #
@@ -276,9 +348,6 @@ class ConstPropOptReverter(OptimizationPass):
         pass
 
     def _handle_ConditionalJump_pair(self, obj0, blk0, obj1, blk1):
-        pass
-
-    def _handle_Return_pair(self, obj0, blk0, obj1, blk1):
         pass
 
     #
