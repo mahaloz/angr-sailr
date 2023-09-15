@@ -1,7 +1,6 @@
-import textwrap
 from collections import defaultdict
 from copy import deepcopy
-from typing import List, Tuple, Optional, Dict, Set, Union, Iterator
+from typing import List, Tuple, Optional, Dict, Set, Union
 import logging
 from itertools import combinations
 import itertools
@@ -12,24 +11,15 @@ import networkx as nx
 import ailment
 from ailment import AILBlockWalkerBase
 from ailment.block import Block
-from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Label
+from ailment.statement import Statement, ConditionalJump, Jump, Assignment
 from ailment.expression import Const, Register, Convert, BinaryOp, Expression
-import claripy
-
-from angr.knowledge_plugins.key_definitions.atoms import (
-    Atom,
-    MemoryLocation,
-    Register,
-    SpOffset,
-    ConstantSrc
-)
 
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ..ailblock_io_finder import AILBlockIOFinder
-from ..condition_processor import ConditionProcessor
-from ..goto_manager import GotoManager, Goto
-from ..region_identifier import RegionIdentifier, GraphRegion, MultiNode
+from ..goto_manager import GotoManager
+from ..region_identifier import RegionIdentifier
 from ..structuring import RecursiveStructurer, PhoenixStructurer
+from ..structuring.structurer_nodes import IncompleteSwitchCaseHeadStatement
 from ....analyses.reaching_definitions.reaching_definitions import ReachingDefinitionsAnalysis
 from ..utils import to_ail_supergraph, remove_labels
 from ... import AnalysesHub
@@ -39,17 +29,34 @@ l = logging.getLogger(name=__name__)
 _DEBUG = False
 l.setLevel(logging.DEBUG)
 
+#
+# Exception Types
+#
 
-#
-# Util Classes
-#
 
 class StructuringError(Exception):
+    """
+    These types of errors are fatal and prevent any future working from structuring in this pass
+    """
+
     pass
 
 
 class SAILRSemanticError(Exception):
+    """
+    These types of errors may not kill the entire analysis, but they do kill the current working round.
+    """
+
     pass
+
+
+class UnsupportedAILNodeError(SAILRSemanticError):
+    pass
+
+
+#
+# Util Classes
+#
 
 
 class ConditionBooleanWalker(AILBlockWalkerBase):
@@ -82,6 +89,7 @@ class ConditionBooleanWalker(AILBlockWalkerBase):
     if (should_do_thing)
         do_thing();
     """
+
     def __init__(self):
         super().__init__()
         self.boolean_cnt = 0
@@ -97,13 +105,9 @@ class ConditionBooleanWalker(AILBlockWalkerBase):
 
 
 class AILMergeGraph:
-    def __init__(self,
-                 graph=None,
-                 original_graph=None,
-                 conditional_block=None,
-                 original_blocks=None,
-                 original_split_blocks=None
-                 ):
+    def __init__(
+        self, graph=None, original_graph=None, conditional_block=None, original_blocks=None, original_split_blocks=None
+    ):
         self.graph = graph or nx.DiGraph()
         self.original_graph = original_graph or nx.DiGraph()
         self.conditional_block = conditional_block
@@ -121,8 +125,8 @@ class AILMergeGraph:
         # are contained in the larger CFG
         self.merge_blocks_to_originals: Dict[Block, Set[Union[Block, AILBlockSplit]]] = defaultdict(set)
         self.merge_end_to_start: Dict[Block, Block] = {}
-        self.starts = list()
-        self.original_ends = list()
+        self.starts = []
+        self.original_ends = []
 
     def create_conditionless_graph(self, starting_blocks: List[Block], graph_lcs):
         # get all the original blocks (reverted from the LCS) and their split blocks.
@@ -140,9 +144,7 @@ class AILMergeGraph:
             ]
 
         # eliminate shared blocks that are the same in original blocks
-        shared_blocks = set(self.original_blocks[merge_base]).intersection(
-            set(self.original_blocks[other_base])
-        )
+        shared_blocks = set(self.original_blocks[merge_base]).intersection(set(self.original_blocks[other_base]))
         for shared_block in shared_blocks:
             for block in self.starts:
                 if shared_block not in self.original_blocks[block]:
@@ -167,8 +169,7 @@ class AILMergeGraph:
         # that should be split replaced.
         # this graph is only the initial merge_graph needed, where only the blocks
         self.graph, update_blocks = clone_graph_replace_splits(
-            nx.subgraph(self.original_graph, self.original_blocks[merge_base]),
-            base_to_split
+            nx.subgraph(self.original_graph, self.original_blocks[merge_base]), base_to_split
         )
         self._update_all_split_refs(update_blocks)
         for update_block, new_block in update_blocks.items():
@@ -183,7 +184,11 @@ class AILMergeGraph:
             for split_block in self.original_split_blocks[block]:
                 if split_block.up_split:
                     merge_base_split = self._find_split_block_by_original(merge_base) or merge_base
-                    merge_base_split = merge_base_split.match_split if isinstance(merge_base_split, AILBlockSplit) else merge_base_split
+                    merge_base_split = (
+                        merge_base_split.match_split
+                        if isinstance(merge_base_split, AILBlockSplit)
+                        else merge_base_split
+                    )
 
                     self.graph.add_edge(split_block.up_split, merge_base_split)
 
@@ -199,7 +204,7 @@ class AILMergeGraph:
             cond_jump_stmt: ConditionalJump = cond_copy.statements[-1]
             if not merge_end_pair:
                 l.info(f"Encountered a conditional jump that has no successors on {self.starts}!")
-                raise SAILRSemanticError(f"Encountered a conditional jump that has no successors! This can be bad!")
+                raise SAILRSemanticError("Encountered a conditional jump that has no successors! This can be bad!")
             elif len(merge_end_pair) == 1:
                 b0 = merge_end_pair[0]
                 b0_og = list(self.merge_blocks_to_originals[b0])[0]
@@ -209,7 +214,9 @@ class AILMergeGraph:
                 b1_og = self._find_block_pair_in_originals(b0_og)
                 if b1_og is None:
                     l.info(f"Encountered a conditional jump that has only 1 successor on {self.starts}!")
-                    raise SAILRSemanticError(f"Encountered a conditional jump that has only 1 successor on {self.starts}!")
+                    raise SAILRSemanticError(
+                        f"Encountered a conditional jump that has only 1 successor on {self.starts}!"
+                    )
 
                 b1_og_succs = list(self.original_graph.successors(b1_og))
                 assert len(b1_og_succs) == 1
@@ -294,11 +301,11 @@ class AILMergeGraph:
 
         # mappings are collected, now we need to connect the merge ends of the graph to the upper parts with
         # the conditions that blocked the original
-        merge_ends = {block: split for block, split in self.merge_blocks_to_originals.items() if block not in self.graph}
-        assert all(len(bs) == 1 for block, bs in self.merge_blocks_to_originals.items() if block in merge_ends)
-        self.merge_end_to_start = {
-            merge_end: self._find_og_start_by_merge_end(merge_end) for merge_end in merge_ends
+        merge_ends = {
+            block: split for block, split in self.merge_blocks_to_originals.items() if block not in self.graph
         }
+        assert all(len(bs) == 1 for block, bs in self.merge_blocks_to_originals.items() if block in merge_ends)
+        self.merge_end_to_start = {merge_end: self._find_og_start_by_merge_end(merge_end) for merge_end in merge_ends}
         merge_end_pairs = defaultdict(list)
         for merge_end, split_blocks in merge_ends.items():
             split_block = list(split_blocks)[0]
@@ -334,8 +341,7 @@ class AILMergeGraph:
 
                         found = False
                         for og in originals:
-                            if isinstance(og, AILBlockSplit) and og.original == block and \
-                                    merge == og.match_split:
+                            if isinstance(og, AILBlockSplit) and og.original == block and merge == og.match_split:
                                 self.merge_blocks_to_originals[merge].add(other_block)
                                 found = True
                                 break
@@ -492,18 +498,19 @@ class AILBlockSplit:
             return None, block, None
 
         up_split = ail_block_from_stmts(block.statements[:split_idx], block_addr=block.addr)
-        match_split = ail_block_from_stmts(block.statements[split_idx:split_idx + split_len],
-                                           block_addr=None if up_split else block.addr)
-        down_split = ail_block_from_stmts(block.statements[split_idx + split_len:])
+        match_split = ail_block_from_stmts(
+            block.statements[split_idx : split_idx + split_len], block_addr=None if up_split else block.addr
+        )
+        down_split = ail_block_from_stmts(block.statements[split_idx + split_len :])
 
         return up_split, match_split, down_split
 
     def __str__(self):
-
         return f"<AILBlockSplit: OG: {self.original.__repr__()} | Up: {self.up_split.__repr__()} | Match: {self.match_split.__repr__()} | Down: {self.down_split.__repr__()}>"
 
     def __repr__(self):
         return self.__str__()
+
 
 #
 # Graph Utils
@@ -532,8 +539,9 @@ def remove_useless_gotos(graph: nx.DiGraph):
     for node in graph:
         node_copy = node.copy()
         # remove Jumps from everything except the last node in the statements list
-        node_copy.statements = [stmt for stmt in node_copy.statements[:-1] if
-                                not isinstance(stmt, Jump)] + node_copy.statements[-1:]
+        node_copy.statements = [
+            stmt for stmt in node_copy.statements[:-1] if not isinstance(stmt, Jump)
+        ] + node_copy.statements[-1:]
         nodes_map[node] = node_copy
 
     new_graph.add_nodes_from(nodes_map.values())
@@ -566,9 +574,12 @@ def find_block_in_successors_by_addr(addr: int, block: ailment.Block, graph: nx.
 
 def find_block_by_addr(graph: networkx.DiGraph, addr, insn_addr=False):
     if insn_addr:
+
         def _get_addr(b):
             return b.statements[0].ins_addr
+
     else:
+
         def _get_addr(b):
             return b.addr
 
@@ -594,9 +605,7 @@ def clone_graph_replace_splits(graph: nx.DiGraph, split_map: Dict[Block, Block])
         for pred in list(graph.predecessors(original_node)):
             new_pred = pred.copy()
             new_pred.statements[-1] = correct_jump_targets(
-                new_pred.statements[-1],
-                {original_node.addr: new_node.addr},
-                new_stmt=True
+                new_pred.statements[-1], {original_node.addr: new_node.addr}, new_stmt=True
             )
             updated_blocks[pred] = new_pred
             replace_node_in_graph(graph, pred, new_pred)
@@ -614,9 +623,7 @@ def clone_graph_replace_splits(graph: nx.DiGraph, split_map: Dict[Block, Block])
 
 
 def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
-    split_map = {
-        (block.addr, block.idx): new_node for block, new_node in split_map_param.items()
-    }
+    split_map = {(block.addr, block.idx): new_node for block, new_node in split_map_param.items()}
     graph = copy_graph_and_nodes(graph_param)
     # this loop will continue to iterate until there are no more
     # nodes found in the split_map to change
@@ -635,11 +642,7 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
         graph.add_node(new_node)
         for pred in graph.predecessors(node):
             last_stmt = pred.statements[-1]
-            pred.statements[-1] = correct_jump_targets(
-                last_stmt,
-                {node.addr: new_node.addr},
-                new_stmt=True
-            )
+            pred.statements[-1] = correct_jump_targets(last_stmt, {node.addr: new_node.addr}, new_stmt=True)
 
             graph.add_edge(pred, new_node)
 
@@ -651,9 +654,7 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
     for node in graph.nodes():
         last_stmt = node.statements[-1]
         node.statements[-1] = correct_jump_targets(
-            last_stmt,
-            {orig_addr: new.addr for orig_addr, new in split_map.items()},
-            new_stmt=True
+            last_stmt, {orig_addr: new.addr for orig_addr, new in split_map.items()}, new_stmt=True
         )
 
     return graph
@@ -681,13 +682,18 @@ def replace_node_in_graph(graph: networkx.DiGraph, node, replace_with):
     assert node not in graph
 
 
-
-
 def bfs_list_blocks(start_block: Block, graph: nx.DiGraph):
     blocks = []
     bfs = list(nx.bfs_successors(graph, start_block, depth_limit=10))
     for blk_tree in bfs:
         source, children = blk_tree
+        last_src_stmt = source.statements[-1] if source.statements else None
+        if (
+            last_src_stmt is None
+            or not isinstance(last_src_stmt, Statement)
+            or isinstance(last_src_stmt, IncompleteSwitchCaseHeadStatement)
+        ):
+            raise UnsupportedAILNodeError(f"Stmt {last_src_stmt} is unsupported")
 
         if len(children) == 1:
             blocks += children
@@ -763,9 +769,11 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
             if not cnode.statements:
                 continue
 
-            if isinstance(cnode.statements[-1], ConditionalJump) \
-                    and all(dominates(idoms, cnode, node) for node in nodes) \
-                    and cnode not in nodes:
+            if (
+                isinstance(cnode.statements[-1], ConditionalJump)
+                and all(dominates(idoms, cnode, node) for node in nodes)
+                and cnode not in nodes
+            ):
                 return cnode
 
         # if no dominators found, move up a level
@@ -803,8 +811,8 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
 
     # AIL Statements
     elif isinstance(ail_obj1, Statement):
-        #if all(barr in [0x404530, 0x404573] for barr in [ail_obj1.ins_addr, ail_obj2.ins_addr]):
-        #    breakpoint()
+        # if all(barr in [0x404530, 0x404573] for barr in [ail_obj1.ins_addr, ail_obj2.ins_addr]):
+        #    do a breakpoint
 
         # ConditionalJump Handler
         if isinstance(ail_obj1, ConditionalJump):
@@ -835,8 +843,8 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
                     # this will require a recursive call into similar() to check if a jump and empty are equal
                     #
                     # when one block has a jump but the other is empty, they are possibly similar
-                    #larger_blk = t1_blk if not t2_blk.statements else t2_blk
-                    #if len(larger_blk.statements) == 1 and isinstance(larger_blk.statements[-1], Jump):
+                    # larger_blk = t1_blk if not t2_blk.statements else t2_blk
+                    # if len(larger_blk.statements) == 1 and isinstance(larger_blk.statements[-1], Jump):
                     #    continue
                     return False
 
@@ -874,11 +882,7 @@ def deepcopy_ail_jump(stmt: Jump, idx=1):
     target: Const = stmt.target
     tags = stmt.tags.copy()
 
-    return Jump(
-        idx,
-        Const(1, target.variable, target.value, target.bits, **target.tags.copy()),
-        **tags
-    )
+    return Jump(idx, Const(1, target.variable, target.value, target.bits, **target.tags.copy()), **tags)
 
 
 def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
@@ -891,7 +895,7 @@ def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
         stmt.condition.copy(),
         Const(1, true_target.variable, true_target.value, true_target.bits, **true_target.tags.copy()),
         Const(1, false_target.variable, false_target.value, false_target.bits, **false_target.tags.copy()),
-        **tags
+        **tags,
     )
 
 
@@ -901,8 +905,10 @@ def deepcopy_ail_anyjump(stmt: Union[Jump, ConditionalJump], idx=1):
     elif isinstance(stmt, ConditionalJump):
         return deepcopy_ail_condjump(stmt, idx=idx)
     else:
-        raise Exception("Attempting to deepcopy non-jump stmt, likely happen to a "
-                        "block ending in no jump. Place a jump there to fix it.")
+        raise Exception(
+            "Attempting to deepcopy non-jump stmt, likely happen to a "
+            "block ending in no jump. Place a jump there to fix it."
+        )
 
 
 def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=True):
@@ -920,7 +926,7 @@ def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=True):
             false_target.value = replacement_map[false_target.value]
 
         return cond_stmt
-    elif isinstance(stmt, Jump):
+    elif isinstance(stmt, Jump) and isinstance(stmt.target, Const):
         jump_stmt = deepcopy_ail_jump(stmt) if new_stmt else stmt
         target = jump_stmt.target
 
@@ -936,6 +942,7 @@ def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=True):
 # Longest Common Substring Search Helpers/Functions
 #
 
+
 def _kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=True):
     """
     Uses the Knuth-Morris-Pratt algorithm for searching.
@@ -950,8 +957,9 @@ def _kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=True):
     shifts = [1] * (len(search_pattern) + 1)
     shift = 1
     for pos in range(len(search_pattern)):
-        while shift <= pos and not similar(search_pattern[pos], search_pattern[pos - shift], graph=graph,
-                                           partial=partial):
+        while shift <= pos and not similar(
+            search_pattern[pos], search_pattern[pos - shift], graph=graph, partial=partial
+        ):
             shift += shifts[pos - shift]
         shifts[pos + 1] = shift
 
@@ -959,8 +967,11 @@ def _kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=True):
     start_pos = 0
     match_len = 0
     for c in stmt_seq:
-        while match_len == len(search_pattern) or match_len >= 0 and \
-                not similar(search_pattern[match_len], c, graph=graph, partial=partial):
+        while (
+            match_len == len(search_pattern)
+            or match_len >= 0
+            and not similar(search_pattern[match_len], c, graph=graph, partial=partial)
+        ):
             start_pos += shifts[match_len]
             match_len -= shifts[match_len]
         match_len += 1
@@ -1015,8 +1026,9 @@ def longest_ail_subseq(stmts_list, graph=None):
         for i in range(len(stmts_list[0])):
             for j in range(len(stmts_list[0]) - i + 1):
                 if j > len(subseq) and all(
-                        stmts_in_other(stmts_list[0][i:i + j], stmts, graph=graph) for stmts in stmts_list):
-                    subseq = stmts_list[0][i:i + j]
+                    stmts_in_other(stmts_list[0][i : i + j], stmts, graph=graph) for stmts in stmts_list
+                ):
+                    subseq = stmts_list[0][i : i + j]
 
     if not subseq:
         return None, [None] * len(stmts_list)
@@ -1026,9 +1038,7 @@ def longest_ail_subseq(stmts_list, graph=None):
 
 def longest_ail_graph_subseq(block_list, graph):
     # generate a graph similarity for each pair in the provided blocks
-    all_sims = [
-        ail_graph_similarity(pair[0], pair[1], graph) for pair in itertools.combinations(block_list, 2)
-    ]
+    all_sims = [ail_graph_similarity(pair[0], pair[1], graph) for pair in itertools.combinations(block_list, 2)]
 
     lcs, _ = longest_ail_subseq(all_sims, graph=graph)
     return lcs
@@ -1037,7 +1047,7 @@ def longest_ail_graph_subseq(block_list, graph):
 def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_blocks=False):
     b0_blocks = bfs_list_blocks(block0, graph)
     b1_blocks = bfs_list_blocks(block1, graph)
-    similarity = list()
+    similarity = []
 
     discontinuity_blocks = set()
     for i, b0 in enumerate(b0_blocks):
@@ -1102,15 +1112,15 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
     traversal_blocks = bfs_list_blocks(orig_block, graph)
 
     graph_sim = graph_similarity.copy()
-    orig_blocks = list()
+    orig_blocks = []
     split_blocks = {}  # [block] = (lcs, idx)
     for block in traversal_blocks:
         if not graph_sim:
             break
 
-        lcs, lcs_idxs = longest_ail_subseq([block.statements, graph_sim[:len(block.statements)]], graph=graph)
+        lcs, lcs_idxs = longest_ail_subseq([block.statements, graph_sim[: len(block.statements)]], graph=graph)
         if block is orig_block:
-            lcs_1, lcs_idxs_1 = longest_ail_subseq([graph_sim[:len(block.statements)], block.statements], graph=graph)
+            lcs_1, lcs_idxs_1 = longest_ail_subseq([graph_sim[: len(block.statements)], block.statements], graph=graph)
             if lcs_idxs_1[1] > lcs_idxs[0]:
                 lcs, lcs_idxs = lcs_1, lcs_idxs_1[::-1]
 
@@ -1122,7 +1132,7 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
         if len(lcs) != len(block.statements):
             split_blocks[block] = (lcs, lcs_idxs[0])
 
-        graph_sim = graph_sim[len(lcs):]
+        graph_sim = graph_sim[len(lcs) :]
 
     return orig_blocks, split_blocks
 
@@ -1130,6 +1140,7 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
 #
 # Simple Optimizations
 #
+
 
 def remove_redundant_jumps(graph: nx.DiGraph):
     """
@@ -1152,8 +1163,9 @@ def remove_redundant_jumps(graph: nx.DiGraph):
             # never remove jumps that could have statements that are executed before them
             # OR
             # stmts that have a non-const jump (like a switch statement)
-            if isinstance(last_stmt, Jump) and \
-                    (len(target_blk.statements) > 1 or not isinstance(last_stmt.target, ailment.expression.Const)):
+            if isinstance(last_stmt, Jump) and (
+                len(target_blk.statements) > 1 or not isinstance(last_stmt.target, ailment.expression.Const)
+            ):
                 continue
 
             # must have successors otherwise we could be removing a final jump out of the function
@@ -1197,10 +1209,7 @@ def remove_redundant_jumps(graph: nx.DiGraph):
             # All the predecessors need to now point to the successor of the node that is about to be removed
             for pred in graph.predecessors(target_blk):
                 last_pred_stmt = pred.statements[-1]
-                pred.statements[-1] = correct_jump_targets(
-                    last_pred_stmt,
-                    {target_blk.addr: successor.addr}
-                )
+                pred.statements[-1] = correct_jump_targets(last_pred_stmt, {target_blk.addr: successor.addr})
                 graph.add_edge(pred, successor)
 
             graph.remove_node(target_blk)
@@ -1239,18 +1248,19 @@ class DuplicationOptReverter(OptimizationPass):
     Reverts the duplication of statements
     """
 
-    ARCHES = ["X86", "AMD64", "ARMCortexM", "ARMHF", "ARMEL", ]
+    ARCHES = [
+        "X86",
+        "AMD64",
+        "ARMCortexM",
+        "ARMHF",
+        "ARMEL",
+    ]
     PLATFORMS = ["cgc", "linux"]
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Revert Statement Duplication Opt"
     DESCRIPTION = __doc__.strip()
 
-    def __init__(self,
-                 func,
-                 region_identifier=None,
-                 reaching_definitions=None,
-                 max_guarding_conditions=4,
-                 **kwargs):
+    def __init__(self, func, region_identifier=None, reaching_definitions=None, max_guarding_conditions=4, **kwargs):
         self.ri: RegionIdentifier = region_identifier
         self.rd: ReachingDefinitionsAnalysis = reaching_definitions
         super().__init__(func, **kwargs)
@@ -1310,12 +1320,13 @@ class DuplicationOptReverter(OptimizationPass):
                 future_irreducible_gotos = self._find_future_irreducible_gotos()
                 targetable_goto_cnt = len(self.goto_manager.gotos) - len(future_irreducible_gotos)
                 if targetable_goto_cnt > self._starting_goto_count:
-                    l.info(f"{self.__class__.__name__} generated >= gotos then it started with "
-                           f"{self._starting_goto_count} -> {targetable_goto_cnt}. Reverting...")
+                    l.info(
+                        f"{self.__class__.__name__} generated >= gotos then it started with "
+                        f"{self._starting_goto_count} -> {targetable_goto_cnt}. Reverting..."
+                    )
                     output_graph = False
 
             self.out_graph = add_labels(remove_useless_gotos(self.out_graph)) if output_graph else None
-
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
@@ -1356,14 +1367,14 @@ class DuplicationOptReverter(OptimizationPass):
         # do structuring
         self.write_graph = add_labels(self.write_graph)
         self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
-            self._func, graph=self.write_graph, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
-            complete_successors=True
+            self._func,
+            graph=self.write_graph,
+            cond_proc=self.ri.cond_proc,
+            force_loop_single_exit=False,
+            complete_successors=True,
         )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
-            deepcopy(self.ri.region),
-            cond_proc=self.ri.cond_proc,
-            func=self._func,
-            structurer_cls=PhoenixStructurer
+            deepcopy(self.ri.region), cond_proc=self.ri.cond_proc, func=self._func, structurer_cls=PhoenixStructurer
         )
         self.write_graph = remove_labels(self.write_graph)
         if not rs.result.nodes:
@@ -1429,7 +1440,9 @@ class DuplicationOptReverter(OptimizationPass):
         ail_merge_graph = self.create_merged_subgraph(candidate, self.write_graph)
         candidate = ail_merge_graph.starts
         for block in ail_merge_graph.original_ends:
-            if self._block_has_goto_edge(block, [b for b in ail_merge_graph.original_ends if b is not block], graph=self.write_graph):
+            if self._block_has_goto_edge(
+                block, [b for b in ail_merge_graph.original_ends if b is not block], graph=self.write_graph
+            ):
                 break
         else:
             self.candidate_blacklist.add(tuple(candidate))
@@ -1455,9 +1468,11 @@ class DuplicationOptReverter(OptimizationPass):
             curr_succs = list(self.write_graph.successors(merged_node))
 
             # skip any nodes that already have enough successors
-            if (not isinstance(last_stmt, (ConditionalJump, Jump)) and len(curr_succs) == 1) or \
-                    (isinstance(last_stmt, Jump) and len(curr_succs) == 1) or \
-                    (isinstance(last_stmt, ConditionalJump) and len(curr_succs) == 2):
+            if (
+                (not isinstance(last_stmt, (ConditionalJump, Jump)) and len(curr_succs) == 1)
+                or (isinstance(last_stmt, Jump) and len(curr_succs) == 1)
+                or (isinstance(last_stmt, ConditionalJump) and len(curr_succs) == 2)
+            ):
                 continue
 
             all_og_succs = set()
@@ -1508,7 +1523,7 @@ class DuplicationOptReverter(OptimizationPass):
 
                 replacement_map = {}
                 for target_addr in target_addrs:
-                    target_candidates = list()
+                    target_candidates = []
                     for mblock, oblocks in ail_merge_graph.merge_blocks_to_originals.items():
                         for oblock in oblocks:
                             if isinstance(oblock, AILBlockSplit) and oblock.original.addr == target_addr:
@@ -1559,11 +1574,7 @@ class DuplicationOptReverter(OptimizationPass):
                     self.write_graph.add_edge(orig_pred, new_target)
 
                 new_pred = orig_pred.copy()
-                new_pred.statements[-1] = correct_jump_targets(
-                    new_pred.statements[-1],
-                    replacement_map,
-                    new_stmt=True
-                )
+                new_pred.statements[-1] = correct_jump_targets(new_pred.statements[-1], replacement_map, new_stmt=True)
                 if new_pred != orig_pred:
                     replace_node_in_graph(self.write_graph, orig_pred, new_pred)
             else:
@@ -1595,11 +1606,7 @@ class DuplicationOptReverter(OptimizationPass):
     def _construct_best_condition_block_for_merge(self, blocks, graph) -> Tuple[Block, Block]:
         # find the conditions that block both of these blocks
         common_cond = shared_common_conditional_dom(blocks, graph)
-        conditions_by_start = self.collect_conditions_between_nodes(
-            graph,
-            common_cond,
-            blocks
-        )
+        conditions_by_start = self.collect_conditions_between_nodes(graph, common_cond, blocks)
 
         best_condition_pair = None
         for start, condition in conditions_by_start.items():
@@ -1627,7 +1634,7 @@ class DuplicationOptReverter(OptimizationPass):
             best_condition.copy() if best_condition is not None else None,
             Const(None, None, 0, self.project.arch.bits),
             Const(None, None, 0, self.project.arch.bits),
-            **old_stmt_tags
+            **old_stmt_tags,
         )
         cond_block.statements = [cond_jump]
 
@@ -1664,8 +1671,9 @@ class DuplicationOptReverter(OptimizationPass):
             raise NotImplementedError("Statement not in block, and we can't compute moving a stmt to a new block!")
 
         # jumps of any kind are not moveable
-        if (new_idx == len(block.statements) - 1 and isinstance(block.statements[new_idx], (ConditionalJump, Jump))) \
-                or isinstance(stmt, (ConditionalJump, Jump)):
+        if (
+            new_idx == len(block.statements) - 1 and isinstance(block.statements[new_idx], (ConditionalJump, Jump))
+        ) or isinstance(stmt, (ConditionalJump, Jump)):
             return False
 
         io_finder = io_finder or AILBlockIOFinder(block, self.project)
@@ -1685,7 +1693,7 @@ class DuplicationOptReverter(OptimizationPass):
         # moving a statement down in the statements:
         # we much check if it's used by anything below it (greater in index)
         else:
-            for mid_idx in range(curr_idx+1, new_idx+1):
+            for mid_idx in range(curr_idx + 1, new_idx + 1):
                 if self._output_used_by_other_stmt(curr_idx, mid_idx, io_finder):
                     can_move = False
                     break
@@ -1706,12 +1714,14 @@ class DuplicationOptReverter(OptimizationPass):
 
             io_finder_by_block = {
                 new_block1: AILBlockIOFinder(new_block1, self.project),
-                new_block2: AILBlockIOFinder(new_block2, self.project)
+                new_block2: AILBlockIOFinder(new_block2, self.project),
             }
 
             for search_offset in (-1, 1):
                 for b1, b2 in itertools.permutations([new_block1, new_block2], 2):
-                    if lcs_idx_by_block[b1] + search_offset < 0 or lcs_idx_by_block[b1] + search_offset >= len(b1.statements):
+                    if lcs_idx_by_block[b1] + search_offset < 0 or lcs_idx_by_block[b1] + search_offset >= len(
+                        b1.statements
+                    ):
                         continue
 
                     b1_unmatched = b1.statements[lcs_idx_by_block[b1] + search_offset]
@@ -1732,16 +1742,18 @@ class DuplicationOptReverter(OptimizationPass):
                             continue
 
                         # a stmt must be independent to be moveable
-                        if self.stmt_can_move_to(b2_stmt, b2, lcs_idx_by_block[b2] + search_offset, io_finder=io_finder_by_block[b2]):
-                            #prev_stmts = b2.statements.copy()
+                        if self.stmt_can_move_to(
+                            b2_stmt, b2, lcs_idx_by_block[b2] + search_offset, io_finder=io_finder_by_block[b2]
+                        ):
+                            # prev_stmts = b2.statements.copy()
                             b2.statements.remove(b2_stmt)
                             b2.statements.insert(lcs_idx_by_block[b2] + search_offset, b2_stmt)
                             prev_moved.add(b2_stmt)
                             prev_moved.add(b1_unmatched)
 
-                            #new_lcs, _ = longest_ail_subseq([b1.statements, b2.statements])
+                            # new_lcs, _ = longest_ail_subseq([b1.statements, b2.statements])
                             ## if changes make don't make the lcs longer, revert changes
-                            #if len(lcs) >= len(new_lcs):
+                            # if len(lcs) >= len(new_lcs):
                             #    b2.statements = prev_stmts
                             updates = True
                             break
@@ -1775,7 +1787,12 @@ class DuplicationOptReverter(OptimizationPass):
         # Traverse both blocks subgraphs within the original graph and find the longest common AIL sequence.
         # Use one of the blocks subraphs to construct the top-half of the new merged graph that contains no inserted
         # conditions yet. This means the graph is still missing the divergence of the two graphs.
-        graph_lcs = longest_ail_graph_subseq(blocks, graph)
+        try:
+            graph_lcs = longest_ail_graph_subseq(blocks, graph)
+        except SAILRSemanticError as e:
+            self.candidate_blacklist.add(tuple(blocks))
+            raise e
+
         ail_merge_graph = AILMergeGraph(original_graph=graph)
         # some blocks in originals may update during this time (if-statements can change)
         update_blocks = ail_merge_graph.create_conditionless_graph(blocks, graph_lcs)
@@ -1784,8 +1801,9 @@ class DuplicationOptReverter(OptimizationPass):
         # SPECIAL CASE: the merged graph contains only 1 node and no splits
         # allows for an early return without expensive computations
         #
-        if len(ail_merge_graph.graph.nodes) == 1 and \
-                all(not splits for splits in ail_merge_graph.original_split_blocks.values()):
+        if len(ail_merge_graph.graph.nodes) == 1 and all(
+            not splits for splits in ail_merge_graph.original_split_blocks.values()
+        ):
             new_node = list(ail_merge_graph.graph.nodes)[0]
             base_successor = list(graph.successors(blocks[0]))[0]
             other_successor = list(graph.successors(blocks[1]))[0]
@@ -1824,7 +1842,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         # colect the true and false targets for the condition
         block_to_target_map = defaultdict(dict)
-        for (block, cond) in ((block1, cond1), (block2, cond2)):
+        for block, cond in ((block1, cond1), (block2, cond2)):
             for succ in graph.successors(block):
                 if succ.addr == cond.true_target.value:
                     block_to_target_map[block]["true_target"] = succ
@@ -1865,9 +1883,9 @@ class DuplicationOptReverter(OptimizationPass):
             for src, dst in block_map.items():
                 # create a new nop block
                 nop_blk = Block(
-                    self._unique_fake_addr, 0, statements=[
-                        Jump(0, Const(0, 0, 0, self.project.arch.bits), 0, ins_addr=self._unique_fake_addr)
-                    ]
+                    self._unique_fake_addr,
+                    0,
+                    statements=[Jump(0, Const(0, 0, 0, self.project.arch.bits), 0, ins_addr=self._unique_fake_addr)],
                 )
                 self._unique_fake_addr += 1
                 # point src -> nop -> dst
@@ -1906,7 +1924,6 @@ class DuplicationOptReverter(OptimizationPass):
         # if goto edge coming from end block, from any instruction in the block
         # since instructions can shift...
         last_stmt = block.statements[-1]
-        goto_addr = None
 
         gotos = self.goto_manager.gotos_in_block(block)
         for goto in gotos:
@@ -1957,9 +1974,7 @@ class DuplicationOptReverter(OptimizationPass):
         Checks if these gotos could be fixed by eager returns
         """
         endnodes = [node for node in self.out_graph.nodes() if self.out_graph.out_degree[node] == 0]
-        blocks_by_addr = {
-            blk.addr: blk for blk in self.out_graph.nodes()
-        }
+        blocks_by_addr = {blk.addr: blk for blk in self.out_graph.nodes()}
 
         bad_gotos = set()
         for goto in self.goto_manager.gotos:
@@ -1974,11 +1989,13 @@ class DuplicationOptReverter(OptimizationPass):
 
             connects_endnode = False
             for endnode in endnodes:
-                if goto_end_block in self.out_graph and endnode in self.out_graph and nx.has_path(self.out_graph, goto_end_block, endnode):
+                if (
+                    goto_end_block in self.out_graph
+                    and endnode in self.out_graph
+                    and nx.has_path(self.out_graph, goto_end_block, endnode)
+                ):
                     try:
-                        next(
-                            nx.all_simple_paths(self.out_graph, goto_end_block, endnode, cutoff=max_endpoint_distance)
-                        )
+                        next(nx.all_simple_paths(self.out_graph, goto_end_block, endnode, cutoff=max_endpoint_distance))
                     except StopIteration:
                         continue
 
@@ -2028,9 +2045,7 @@ class DuplicationOptReverter(OptimizationPass):
 
             condition = self.ri.cond_proc.simplify_condition(condition)
             if condition.is_true() or condition.is_false():
-                condition = self.ri.cond_proc.simplify_condition(
-                    self.ri.cond_proc.reaching_conditions[sink]
-                )
+                condition = self.ri.cond_proc.simplify_condition(self.ri.cond_proc.reaching_conditions[sink])
 
             conditions_by_start[sink] = self.ri.cond_proc.convert_claripy_bool_ast(condition)
 
@@ -2077,9 +2092,7 @@ class DuplicationOptReverter(OptimizationPass):
         # deep copy the graph and remove instructions that are not control flow altering
         cond_graph = nx.DiGraph()
 
-        block_to_insn_map = {
-            node.addr: node.statements[-1].ins_addr for node in temp_cond_graph.nodes()
-        }
+        block_to_insn_map = {node.addr: node.statements[-1].ins_addr for node in temp_cond_graph.nodes()}
         for merge_start in merge_start_nodes:
             for node in pre_graphs_maps[merge_start].nodes:
                 block_to_insn_map[node.addr] = merge_start.addr
@@ -2088,8 +2101,11 @@ class DuplicationOptReverter(OptimizationPass):
         for node in temp_cond_graph:
             successors = list(temp_cond_graph.successors(node))
             if not isinstance(node.statements[-1], (ConditionalJump, Jump)) and len(successors) == 1:
-                node.statements += [Jump(None, Const(None, None, successors[0].addr, self.project.arch.bits),
-                                         ins_addr=successors[0].addr)]
+                node.statements += [
+                    Jump(
+                        None, Const(None, None, successors[0].addr, self.project.arch.bits), ins_addr=successors[0].addr
+                    )
+                ]
 
         # deepcopy every node in the conditional graph with a unique address
         crafted_blocks = {}
@@ -2115,10 +2131,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         # correct every jump target
         for node in cond_graph.nodes:
-            node.statements[-1] = correct_jump_targets(
-                node.statements[-1],
-                block_to_insn_map
-            )
+            node.statements[-1] = correct_jump_targets(node.statements[-1], block_to_insn_map)
 
         return cond_graph, pre_graphs_maps
 
@@ -2144,15 +2157,15 @@ class DuplicationOptReverter(OptimizationPass):
             return False
 
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
-        initial_candidates = list()
+        initial_candidates = []
         for b0, b1 in combinations(self.read_graph.nodes, 2):
             # TODO: find a better fix for this! Some duplicated nodes need destruction!
             # skip purposefully duplicated nodes
             # if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
             #   continue
 
-            #if all([b.addr in [0x40cc9a, 0x40cdb5] for b in (b0, b1)]):
-            #    breakpoint()
+            # if all([b.addr in [0x40cc9a, 0x40cdb5] for b in (b0, b1)]):
+            #    do a breakpoint
 
             # blocks must have statements
             if not b0.statements or not b1.statements:
@@ -2267,7 +2280,7 @@ class DuplicationOptReverter(OptimizationPass):
         }
 
         while True:
-            removal_queue = list()
+            removal_queue = []
             for candidate in candidates:
                 if candidate in removal_queue:
                     continue
@@ -2346,9 +2359,7 @@ class DuplicationOptReverter(OptimizationPass):
             candidates = merged_candidates + remaining_candidates
 
         candidates = list(set(candidates))
-        candidates = [
-            tuple(sorted(candidate, key=lambda x: x.addr)) for candidate in candidates
-        ]
+        candidates = [tuple(sorted(candidate, key=lambda x: x.addr)) for candidate in candidates]
         candidates = sorted(candidates, key=lambda x: sum([c.addr for c in x]))
 
         return candidates
@@ -2368,7 +2379,7 @@ class DuplicationOptReverter(OptimizationPass):
         while not_fixed:
             not_fixed = False
             nodes = list(graph.nodes())
-            remove_queue = list()
+            remove_queue = []
 
             for b0, b1 in itertools.combinations(nodes, 2):
                 if not self._share_subregion([b0, b1]):
@@ -2409,10 +2420,7 @@ class DuplicationOptReverter(OptimizationPass):
 
                 for pred in graph.predecessors(b1):
                     last_statement = pred.statements[-1]
-                    pred.statements[-1] = correct_jump_targets(
-                        last_statement,
-                        {b1.addr: b0.addr}
-                    )
+                    pred.statements[-1] = correct_jump_targets(last_statement, {b1.addr: b0.addr})
                     graph.add_edge(pred, b0)
 
                 graph.remove_node(b1)
