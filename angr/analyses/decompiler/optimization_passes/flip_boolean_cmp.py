@@ -40,7 +40,9 @@ class FlipBooleanWalker(SequenceWalker):
                 and structured_node_is_simple_return(seq_node.nodes[idx + 1], self._graph)
                 and node not in type1_condition_nodes
             ):
-                type2_condition_nodes.append((idx, node, seq_node.nodes[idx + 1]))
+                #type2_condition_nodes.append((idx, node, seq_node.nodes[idx + 1]))
+                # XXX: SAILR disables type2 bool flip
+                pass
 
         for node in type1_condition_nodes:
             if isinstance(node.condition, Op) and structured_node_is_simple_return(node.false_node, self._graph):
