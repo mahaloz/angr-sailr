@@ -9,6 +9,7 @@ import networkx
 import networkx as nx
 
 import ailment
+from ailment import AILBlockWalkerBase
 from ailment.statement import Jump, ConditionalJump
 from ailment.expression import Const
 from .. import RegionIdentifier
@@ -23,6 +24,25 @@ from ..utils import to_ail_supergraph
 
 l = logging.getLogger(__name__)
 
+
+class AILCallCounter(AILBlockWalkerBase):
+    """
+    Helper class to count AIL Calls in a block
+    """
+
+    calls = 0
+
+    def _handle_Call(self, stmt_idx: int, stmt: "Call", block: Optional["Block"]):
+        self.calls += 1
+        super()._handle_Call(stmt_idx, stmt, block)
+
+
+def _number_of_calls_in(graph: networkx.DiGraph) -> int:
+        counter = AILCallCounter()
+        for node in graph.nodes:
+            counter.walk(node)
+
+        return counter.calls
 
 class CrossJumpReverter(OptimizationPass):
     """
@@ -45,29 +65,17 @@ class CrossJumpReverter(OptimizationPass):
     def __init__(
         self,
         func,
-        blocks_by_addr=None,
-        blocks_by_addr_and_idx=None,
-        graph=None,
-        # internal parameters that should be used by Clinic
         node_idx_start=0,
         # settings
         max_level=10,
-        min_indegree=2,
-        reaching_definitions=None,
-        region_identifier=None,
-        max_level_goto_check=2,
+        call_dup_max=2,
         **kwargs,
     ):
-        super().__init__(
-            func, blocks_by_addr=blocks_by_addr, blocks_by_addr_and_idx=blocks_by_addr_and_idx, graph=graph, **kwargs
-        )
+        super().__init__(func, **kwargs)
 
         self.max_level = max_level
-        self.min_indegree = min_indegree
-        self.max_level_goto_check = max_level_goto_check
         self.node_idx = count(start=node_idx_start)
-        self._rd = reaching_definitions
-        self.ri = region_identifier
+        self.call_dup_max = call_dup_max
 
         self.goto_manager: Optional[GotoManager] = None
         self.initial_gotos = None
@@ -124,15 +132,14 @@ class CrossJumpReverter(OptimizationPass):
         self.goto_manager = None
 
         # do structuring
-        #breakpoint()
         self.graph_copy = add_labels(self.graph_copy)
-        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
-            self._func, graph=self.graph_copy, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+        self._ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=self.graph_copy, cond_proc=self._ri.cond_proc, force_loop_single_exit=False,
             complete_successors=True
         )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
-            copy.deepcopy(self.ri.region),
-            cond_proc=self.ri.cond_proc,
+            copy.deepcopy(self._ri.region),
+            cond_proc=self._ri.cond_proc,
             func=self._func,
             structurer_cls=PhoenixStructurer
         )
@@ -168,6 +175,11 @@ class CrossJumpReverter(OptimizationPass):
                 continue
 
             if graph.out_degree(goto_target) != 1:
+                continue
+
+            counter = AILCallCounter()
+            counter.walk(goto_target)
+            if counter.calls > self.call_dup_max:
                 continue
 
             # og_block -> suc_block (goto target)

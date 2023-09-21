@@ -86,6 +86,9 @@ class GotoManager:
             gotos.update(gotos_by_addr[block.addr])
 
         for stmt in block.statements:
+            if "ins_addr" not in stmt.tags:
+                continue
+
             if stmt.ins_addr in gotos_by_addr:
                 gotos.update(gotos_by_addr[stmt.ins_addr])
 

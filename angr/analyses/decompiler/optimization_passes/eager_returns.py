@@ -264,23 +264,14 @@ class EagerReturnsSimplifier(OptimizationPass):
             to_update[region_head] = in_edges, region
 
         for region_head, (in_edges, region) in to_update.items():
-            if not self._is_single_return_stmt_region(region):
-                has_goto_edge = True
-                for in_edge in in_edges:
-                    pred_node = in_edge[0]
-                    if self._preds_have_goto(pred_node, graph, max_level_up=self.max_level_goto_check):
-                        break
-                else:
-                    has_goto_edge = False
-
-                if not has_goto_edge:
-                    continue
-
             # update the graph
             for in_edge in in_edges:
                 pred_node = in_edge[0]
+                # every edge to copy must have a goto
+                if not self._preds_have_goto(pred_node, graph, max_level_up=self.max_level_goto_check):
+                    continue
 
-                # Modify the graph and then add an edge to the copy of the region
+                # copy the entire return region
                 copies = {}
                 queue = [(pred_node, region_head)]
                 while queue:
@@ -305,10 +296,12 @@ class EagerReturnsSimplifier(OptimizationPass):
                     for succ in region.successors(node):
                         queue.append((node_copy, succ))
 
-            # remove all in-edges that are now duplicated
-            graph.remove_edges_from(in_edges)
-            # remove the node to be copied
-            graph.remove_nodes_from(region)
+                # delete the old edge to the return node
+                graph.remove_edge(pred_node, region_head)
+
+            if region_head in graph and graph.in_degree(region_head) == 0:
+                graph.remove_nodes_from(region)
+
             graph_changed = True
 
         return graph_changed
