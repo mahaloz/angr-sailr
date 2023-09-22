@@ -32,7 +32,7 @@ class GotoSimplifier(SequenceWalker):
     Move the recording of Gotos outside this function
     """
 
-    def __init__(self, node, function=None, kb=None):
+    def __init__(self, node, function=None, kb=None, full_graph=None):
         handlers = {
             SequenceNode: self._handle_sequencenode,
             CodeNode: self._handle_codenode,
@@ -44,6 +44,8 @@ class GotoSimplifier(SequenceWalker):
         }
         self._function = function
         self._kb = kb
+        self._region = node
+        self._full_graph = full_graph
         self.irreducible_gotos = set()
 
         super().__init__(handlers)
@@ -164,14 +166,15 @@ class GotoSimplifier(SequenceWalker):
 
         # normal Goto Label
         if branch_target is None:
-            stmt_target = goto_stmt.target
+            dst_target = goto_stmt.target
         # true branch of a conditional jump
         elif branch_target:
-            stmt_target = goto_stmt.true_target
+            dst_target = goto_stmt.true_target
         # false branch of a conditional jump
         else:
-            stmt_target = goto_stmt.true_target
+            dst_target = goto_stmt.true_target
 
-        goto = Goto(block_addr=block.addr, ins_addr=goto_stmt.ins_addr, target_addr=stmt_target.value)
+        src_ins_addr = goto_stmt.ins_addr if "ins_addr" in goto_stmt.tags else block.addr
+        goto = Goto(block.addr, dst_target.value, src_idx=block.idx, dst_idx=None, src_ins_addr=src_ins_addr)
         l.debug("Storing %r goto", goto)
         self.irreducible_gotos.add(goto)

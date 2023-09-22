@@ -2142,7 +2142,7 @@ class PhoenixStructurer(StructurerBase):
             pass
         else:
             # insert a Jump at the end
-            stmt_addr = last_stmt.ins_addr if last_stmt is not None else src.addr
+            stmt_addr = src.addr
             goto_node = Block(
                 stmt_addr,
                 0,

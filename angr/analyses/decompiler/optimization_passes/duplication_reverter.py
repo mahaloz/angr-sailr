@@ -1248,14 +1248,8 @@ class DuplicationOptReverter(OptimizationPass):
     Reverts the duplication of statements
     """
 
-    ARCHES = [
-        "X86",
-        "AMD64",
-        "ARMCortexM",
-        "ARMHF",
-        "ARMEL",
-    ]
-    PLATFORMS = ["cgc", "linux"]
+    ARCHES = None
+    PLATFORMS = None
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Revert Statement Duplication Opt"
     DESCRIPTION = __doc__.strip()
@@ -1927,7 +1921,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         gotos = self.goto_manager.gotos_in_block(block)
         for goto in gotos:
-            target_block = find_block_in_successors_by_addr(goto.target_addr, block, graph)
+            target_block = find_block_in_successors_by_addr(goto.dst_addr, block, graph)
             if any(self._has_single_successor_path(end, target_block, graph) for end in other_ends):
                 return True
 
@@ -1946,7 +1940,7 @@ class DuplicationOptReverter(OptimizationPass):
                         return True
 
                     for goto in gotos:
-                        if goto.target_addr in (block.addr, block.statements[0].ins_addr):
+                        if goto.dst_addr in (block.addr, block.statements[0].ins_addr):
                             return True
 
             for succ in graph.successors(block):
@@ -1961,7 +1955,7 @@ class DuplicationOptReverter(OptimizationPass):
                         for other_end in other_ends:
                             found = False
                             for other_succ in graph.successors(other_end):
-                                if other_succ.addr == goto.target_addr:
+                                if other_succ.addr == goto.dst_addr:
                                     found = True
 
                             if not found:
@@ -1978,7 +1972,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         bad_gotos = set()
         for goto in self.goto_manager.gotos:
-            goto_end_block = blocks_by_addr.get(goto.target_addr, None)
+            goto_end_block = blocks_by_addr.get(goto.dst_addr, None)
             # skip gotos that don't exist
             if not goto_end_block:
                 continue

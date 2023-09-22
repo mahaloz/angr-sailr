@@ -49,15 +49,8 @@ class CrossJumpReverter(OptimizationPass):
     Copies bad blocks
     """
 
-    # TODO: This optimization pass may support more architectures and platforms
-    ARCHES = [
-        "X86",
-        "AMD64",
-        "ARMCortexM",
-        "ARMHF",
-        "ARMEL",
-    ]
-    PLATFORMS = ["cgc", "linux"]
+    ARCHES = None
+    PLATFORMS = None
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Duplicate blocks destroyed with gotos"
     DESCRIPTION = "DUPLICATE"
@@ -160,13 +153,14 @@ class CrossJumpReverter(OptimizationPass):
         to_update = {}
         for node in graph.nodes:
             gotos = self.goto_manager.gotos_in_block(node)
+            # TODO: support if-stmts
             if not gotos or len(gotos) >= 2:
                 continue
 
             # only single reaching gotos
             goto = list(gotos)[0]
             for goto_target in graph.successors(node):
-                if goto_target.addr == goto.target_addr:
+                if goto_target.addr == goto.dst_addr:
                     break
             else:
                 goto_target = None

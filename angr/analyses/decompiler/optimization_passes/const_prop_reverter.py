@@ -119,14 +119,8 @@ class ConstPropOptReverter(OptimizationPass):
     into a symbolic variable, given that they have the same value on branches.
     """
 
-    ARCHES = [
-        "X86",
-        "AMD64",
-        "ARMCortexM",
-        "ARMHF",
-        "ARMEL",
-    ]
-    PLATFORMS = ["cgc", "linux"]
+    ARCHES = None
+    PLATFORMS = None
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Revert Constant Propagation Opt"
     DESCRIPTION = __doc__.strip()
