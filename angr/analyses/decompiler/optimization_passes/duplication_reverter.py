@@ -1262,7 +1262,7 @@ class DuplicationOptReverter(OptimizationPass):
         self.max_guarding_conditions = max_guarding_conditions
         self.goto_manager: Optional[GotoManager] = None
         self.write_graph: Optional[nx.DiGraph] = None
-        self.candidate_blacklist = None
+        self.candidate_blacklist = set()
 
         self._starting_goto_count = None
         self._unique_fake_addr = 0
@@ -1324,7 +1324,6 @@ class DuplicationOptReverter(OptimizationPass):
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
-        self.candidate_blacklist = set()
 
         updates = True
         while self._round <= max_fix_attempts:
@@ -1406,7 +1405,6 @@ class DuplicationOptReverter(OptimizationPass):
         self.prev_graph = self.out_graph.copy() if self.out_graph is not None else self._graph
         self.out_graph = self.simple_optimize_graph(self.write_graph)
         self.write_graph = self.simple_optimize_graph(self.write_graph)
-        self.candidate_blacklist = set()
 
     def _deduplication_round(self, max_guarding_conditions=10):
         #
@@ -2245,21 +2243,16 @@ class DuplicationOptReverter(OptimizationPass):
         # filter out bad candidates from the blacklist
         #
 
-        while True:
-            removal = False
-            for bad_candidate in self.candidate_blacklist:
-                for candidate in candidates:
-                    # skip candidates in blacklist
-                    if all(bc in candidate for bc in bad_candidate):
-                        candidates.remove(candidate)
-                        removal = True
-                        break
-
-                if removal:
-                    break
-
-            else:
-                break
+        filted_candidates = []
+        id_blacklist = {
+            ((b0.addr, b0.idx), (b1.addr, b1.idx)) for b1, b0 in self.candidate_blacklist
+        }
+        for candidate in candidates:
+            blk_id = ((candidate[0].addr, candidate[0].idx), (candidate[1].addr, candidate[1].idx))
+            rev_blk_id = blk_id[::-1]
+            if blk_id not in id_blacklist and rev_blk_id not in id_blacklist:
+                filted_candidates.append(candidate)
+        candidates = filted_candidates
 
         #
         # First locate all the pairs that may actually be in a merge-graph of one of the already existent
