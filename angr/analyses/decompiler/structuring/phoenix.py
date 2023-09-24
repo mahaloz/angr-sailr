@@ -115,6 +115,8 @@ class PhoenixStructurer(StructurerBase):
         self._edge_virtualization_hints = []
 
         self._use_multistmtexprs = use_multistmtexprs
+        if not self._phoenix_improved:
+            self._use_multistmtexprs = MultiStmtExprMode.NEVER
 
         self._analyze()
 
