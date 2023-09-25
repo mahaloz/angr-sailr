@@ -43,8 +43,8 @@ _all_optimization_passes = [
     (ExprOpSwapper, True),
     (ConstPropOptReverter, True),
     (DuplicationOptReverter, True),
-    (EagerReturnsSimplifier, True),
     (LoweredSwitchSimplifier, True),
+    (EagerReturnsSimplifier, True),
     (CrossJumpReverter, True),
     (FlipBooleanCmp, True),
 ]

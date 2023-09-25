@@ -1,3 +1,4 @@
+import copy
 from typing import Optional, Tuple, Union, List, DefaultDict, TYPE_CHECKING
 from collections import defaultdict, OrderedDict
 import logging
@@ -9,6 +10,9 @@ from ailment.statement import ConditionalJump, Label, Assignment, Jump
 from ailment.expression import Expression, BinaryOp, Const, Load
 
 from angr.utils.graph import GraphUtils
+from .. import RegionIdentifier
+from ..goto_manager import GotoManager
+from ..structuring import RecursiveStructurer, PhoenixStructurer
 from ..utils import first_nonlabel_statement, remove_last_statement
 from ..structuring.structurer_nodes import IncompleteSwitchCaseHeadStatement, SequenceNode, MultiNode
 from .optimization_pass import OptimizationPass, OptimizationPassStage, MultipleBlocksException
@@ -151,13 +155,15 @@ class LoweredSwitchSimplifier(OptimizationPass):
         super().__init__(
             func, blocks_by_addr=blocks_by_addr, blocks_by_addr_and_idx=blocks_by_addr_and_idx, graph=graph, **kwargs
         )
+        self._goto_manager: Optional[GotoManager] = None
+
         self.analyze()
 
     def _check(self):
         # TODO: More filtering
         return True, None
 
-    def _analyze(self, cache=None):
+    def _core_analyze(self, cache=None):
         variablehash_to_cases = self._find_cascading_switch_variable_comparisons()
 
         if not variablehash_to_cases:
@@ -754,4 +760,52 @@ class LoweredSwitchSimplifier(OptimizationPass):
         for case in cases_0:
             if case not in cases_1:
                 return False
+        return True
+
+    #
+    # structuring checks
+    #
+
+    def _analyze(self, cache=None):
+        if not self._graph_is_structurable(self._graph):
+            return
+
+        initial_gotos = self._goto_manager.gotos
+
+        # do analysis and update the out_graph
+        self._core_analyze(cache=cache)
+
+        # updates must structure to get new output (correctness)
+        updates_structurable = self._graph_is_structurable(self.out_graph)
+        if not updates_structurable:
+            self.out_graph = None
+            return
+
+        # updates must have less or equal gotos (optimality)
+        if len(self._goto_manager.gotos) > len(initial_gotos):
+            self.out_graph = None
+            return
+
+    def _graph_is_structurable(self, graph) -> bool:
+        """
+        Check if the graph is structurable through Phoenix, and if so, updates the goto manager
+        associated with this optimization pass.
+        """
+        # identify regions (required for Phoenix)
+        self._ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=graph, cond_proc=self._ri.cond_proc, force_loop_single_exit=False,
+            complete_successors=True
+        )
+        # use Phoenix schema-matching to structure the graph
+        rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
+            copy.deepcopy(self._ri.region),
+            cond_proc=self._ri.cond_proc,
+            func=self._func,
+            structurer_cls=PhoenixStructurer
+        )
+        if not rs.result.nodes:
+            return False
+
+        rs = self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
+        self._goto_manager = rs.goto_manager
         return True
