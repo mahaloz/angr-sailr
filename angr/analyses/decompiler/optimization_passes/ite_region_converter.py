@@ -151,9 +151,9 @@ class ITERegionConverter(OptimizationPass):
             region_head.statements[-1].condition,
             true_stmt.src,
             false_stmt.src,
-            ins_addr=true_stmt.src.ins_addr,
-            vex_block_addr=true_stmt.src.vex_block_addr,
-            vex_stmt_idx=true_stmt.src.vex_stmt_idx,
+            ins_addr=true_stmt.src.ins_addr if 'ins_addr' in true_stmt.src.tags else true_stmt.ins_addr,
+            vex_block_addr=true_stmt.src.vex_block_addr if 'vex_block_addr' in true_stmt.src.tags else true_stmt.vex_block_addr,
+            vex_stmt_idx=true_stmt.src.vex_stmt_idx if 'vex_stmt_idx' in true_stmt.src.tags else true_stmt.vex_stmt_idx,
         )
         new_assignment = true_stmt.copy()
         new_assignment.src = ternary_expr
