@@ -243,7 +243,9 @@ class ConstPropOptReverter(OptimizationPass):
             return
 
         # verify both calls are calls to the same function
-        if not obj0.target.likes(obj1.target):
+        if (isinstance(obj0.target, str) or isinstance(obj1.target, str)) and obj0.target != obj1.target:
+            return
+        elif not obj0.target.likes(obj1.target):
             return
 
         call0, call1 = obj0, obj1
