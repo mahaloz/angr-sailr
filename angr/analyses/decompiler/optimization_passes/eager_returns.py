@@ -7,8 +7,8 @@ import inspect
 import networkx
 import networkx as nx
 
-import ailment
 from ailment.expression import Const
+import ailment
 from ailment import Block
 from ailment.statement import Jump, ConditionalJump, Return, Label
 from ..goto_manager import GotoManager
