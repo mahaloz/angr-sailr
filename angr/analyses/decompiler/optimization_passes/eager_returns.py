@@ -177,46 +177,22 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.goto_manager = rs.goto_manager
         return True, len(self.goto_manager.gotos) != 0
 
-    def _block_has_goto_edge(self, block: ailment.Block, graph=None):
-        # case1:
-        # A -> (goto) -> B.
-        # if goto edge coming from end block, from any instruction in the block
-        # since instructions can shift...
-        if self.goto_manager.gotos_in_block(block):
-            return True
+    def _is_goto_edge(self, src: ailment.Block, dst: ailment.Block, graph: nx.DiGraph, check_for_ifstmts=True):
+        """
+        This function only exists because a long-standing bug that sometimes reports the if-stmt addr
+        above a goto edge as the goto src. Because of this, we need to check for predecessors above the goto and
+        see if they are a goto. This needs to include Jump to deal with loops.
+        """
+        if check_for_ifstmts:
+            blocks = [src] + list(graph.predecessors(src))
+            for block in blocks:
+                if not block.statements or not isinstance(block.statements[-1], (ConditionalJump, Jump)):
+                    continue
 
-        # case2:
-        # A.last (conditional) -> (goto) -> B -> C
-        #
-        # Some condition ends in a goto to one of the ends of the merge graph. In this case,
-        # we consider it a modified version of case2
-        elif graph:
-            for pred in graph.predecessors(block):
-                last_stmt = pred.statements[-1]
-                if isinstance(last_stmt, ConditionalJump) and last_stmt.ins_addr in self.goto_manager.gotos_by_addr():
-                    """
-                    goto: Goto = self.goto_locations[last_stmt.ins_addr]
-                    if goto.target_addr in (block.addr, block.statements[0].ins_addr):
-                        return True
-                    """
+                if self.goto_manager.is_goto_edge(block, dst):
                     return True
-
-        return False
-
-    def _preds_have_goto(self, block, graph: nx.DiGraph, max_level_up=2):
-        all_blocks = [block]
-        level_blocks = [block]
-        for _ in range(max_level_up):
-            new_level_blocks = []
-            for lblock in level_blocks:
-                new_level_blocks += list(graph.predecessors(lblock))
-
-            all_blocks += new_level_blocks
-            level_blocks = new_level_blocks
-
-        for ablock in all_blocks:
-            if self._block_has_goto_edge(ablock):
-                return True
+        else:
+            return self.goto_manager.is_goto_edge(src, dst)
 
         return False
 
@@ -278,7 +254,7 @@ class EagerReturnsSimplifier(OptimizationPass):
                 # returns that are only returning a constant should be duplicated always;
                 # returns that do anything more than a const ret, need to be checked for gotos
                 if not is_single_const_ret_region:
-                    if not self.goto_manager.is_goto_edge(pred_node, region_head):
+                    if not self._is_goto_edge(pred_node, region_head, graph=graph, check_for_ifstmts=True):
                         continue
 
                 # copy the entire return region
