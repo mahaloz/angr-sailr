@@ -130,9 +130,9 @@ class EagerReturnsSimplifier(OptimizationPass):
                 self.graph_copy = self.last_graph
                 break
 
-            if not graph_has_gotos:
-                _l.debug("Graph has no gotos. Leaving analysis...")
-                break
+            #if not graph_has_gotos:
+            #    _l.debug("Graph has no gotos. Leaving analysis...")
+            #    break
 
             # make a clone of graph copy to recover in the event of failure
             self.last_graph = self.graph_copy.copy()
@@ -271,12 +271,15 @@ class EagerReturnsSimplifier(OptimizationPass):
             to_update[region_head] = in_edges, region
 
         for region_head, (in_edges, region) in to_update.items():
-            # update the graph
+            is_single_const_ret_region = self._is_single_constant_return_graph(region)
             for in_edge in in_edges:
                 pred_node = in_edge[0]
-                # every edge to copy must have a goto
-                if not self.goto_manager.is_goto_edge(pred_node, region_head):
-                    continue
+
+                # returns that are only returning a constant should be duplicated always;
+                # returns that do anything more than a const ret, need to be checked for gotos
+                if not is_single_const_ret_region:
+                    if not self.goto_manager.is_goto_edge(pred_node, region_head):
+                        continue
 
                 # copy the entire return region
                 copies = {}
@@ -312,6 +315,35 @@ class EagerReturnsSimplifier(OptimizationPass):
             graph_changed = True
 
         return graph_changed
+
+    @staticmethod
+    def _is_single_constant_return_graph(graph: networkx.DiGraph):
+        """
+        Check if the graph is a single block that returns a constant.
+        """
+        labeless_graph = remove_labels(graph)
+        nodes = list(labeless_graph.nodes())
+        if len(nodes) != 1:
+            return False
+
+        return_node: Block = nodes[0]
+        stmts = return_node.statements
+        if not stmts or len(stmts) != 1:
+            return False
+
+        stmt = stmts[0]
+        if not isinstance(stmt, Return):
+            return False
+
+        ret_exprs = stmt.ret_exprs
+        if not ret_exprs or len(ret_exprs) != 1:
+            return False
+
+        ret_expr = ret_exprs[0]
+        if isinstance(ret_expr, ailment.Expr.Convert):
+            ret_expr = ret_expr.operand
+
+        return isinstance(ret_expr, ailment.Expr.Const)
 
     @staticmethod
     def _number_of_calls_in(graph: networkx.DiGraph) -> int:
