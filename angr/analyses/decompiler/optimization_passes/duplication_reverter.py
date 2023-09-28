@@ -23,6 +23,7 @@ from ..structuring.structurer_nodes import IncompleteSwitchCaseHeadStatement
 from ....analyses.reaching_definitions.reaching_definitions import ReachingDefinitionsAnalysis
 from ..utils import to_ail_supergraph, remove_labels
 from ... import AnalysesHub
+from ....knowledge_plugins.key_definitions.atoms import MemoryLocation
 from ....utils.graph import dominates
 
 l = logging.getLogger(name=__name__)
