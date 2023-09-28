@@ -7,10 +7,11 @@ import inspect
 import networkx
 import networkx as nx
 
+from ailment.statement import Jump, ConditionalJump
 from ailment.expression import Const
 import ailment
 from ailment import Block
-from ailment.statement import Jump, ConditionalJump, Return, Label
+from ailment.statement import Return, Label
 from ..goto_manager import GotoManager
 from .. import RegionIdentifier
 from ailment.block_walker import AILBlockWalkerBase
