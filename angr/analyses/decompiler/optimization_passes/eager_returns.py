@@ -177,18 +177,27 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.goto_manager = rs.goto_manager
         return True, len(self.goto_manager.gotos) != 0
 
-    def _is_goto_edge(self, src: ailment.Block, dst: ailment.Block, graph: nx.DiGraph, check_for_ifstmts=True):
+    def _is_goto_edge(
+        self, src: ailment.Block, dst: ailment.Block, graph: nx.DiGraph = None, check_for_ifstmts=True,
+        max_level_check=2
+    ):
         """
         This function only exists because a long-standing bug that sometimes reports the if-stmt addr
         above a goto edge as the goto src. Because of this, we need to check for predecessors above the goto and
         see if they are a goto. This needs to include Jump to deal with loops.
         """
-        if check_for_ifstmts:
-            blocks = [src] + list(graph.predecessors(src))
-            for block in blocks:
-                if not block.statements or not isinstance(block.statements[-1], (ConditionalJump, Jump)):
-                    continue
+        if check_for_ifstmts and graph is not None:
+            blocks = [src]
+            level_blocks = [src]
+            for _ in range(max_level_check):
+                new_level_blocks = []
+                for lblock in level_blocks:
+                    new_level_blocks += list(graph.predecessors(lblock))
 
+                blocks += new_level_blocks
+                level_blocks = new_level_blocks
+
+            for block in blocks:
                 if self.goto_manager.is_goto_edge(block, dst):
                     return True
         else:
@@ -196,14 +205,13 @@ class EagerReturnsSimplifier(OptimizationPass):
 
         return False
 
-    def _analyze_core(self, graph: networkx.DiGraph):
+    def _find_endnode_regions(self, graph):
         endnodes = [node for node in graph.nodes() if graph.out_degree[node] == 0]
-        graph_changed = False
 
         # to_update is keyed by the region head.
         # this is because different end nodes may lead to the same region head: consider the case of the typical "fork"
         # region where stack canary is checked in x86-64 binaries.
-        to_update: Dict[Any, Tuple[List[Tuple[Any, Any]], networkx.DiGraph]] = {}
+        end_node_regions: Dict[Any, Tuple[List[Tuple[Any, Any]], networkx.DiGraph]] = {}
 
         for end_node in endnodes:
             in_edges = list(graph.in_edges(end_node))
@@ -244,8 +252,13 @@ class EagerReturnsSimplifier(OptimizationPass):
             if self._number_of_calls_in(region) > self.max_calls_in_region:
                 continue
 
-            to_update[region_head] = in_edges, region
+            end_node_regions[region_head] = in_edges, region
 
+        return end_node_regions
+
+    def _analyze_core(self, graph: networkx.DiGraph):
+        graph_changed = False
+        to_update = self._find_endnode_regions(graph)
         for region_head, (in_edges, region) in to_update.items():
             is_single_const_ret_region = self._is_single_constant_return_graph(region)
             for in_edge in in_edges:
