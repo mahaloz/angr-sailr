@@ -179,7 +179,7 @@ class EagerReturnsSimplifier(OptimizationPass):
 
     def _is_goto_edge(
         self, src: ailment.Block, dst: ailment.Block, graph: nx.DiGraph = None, check_for_ifstmts=True,
-        max_level_check=2
+        max_level_check=7
     ):
         """
         This function only exists because a long-standing bug that sometimes reports the if-stmt addr
