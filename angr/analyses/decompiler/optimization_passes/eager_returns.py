@@ -8,9 +8,9 @@ import networkx
 import networkx as nx
 
 import ailment
+from ailment.expression import Const
 from ailment import Block
 from ailment.statement import Jump, ConditionalJump, Return, Label
-from ailment.expression import Const
 from ..goto_manager import GotoManager
 from .. import RegionIdentifier
 from ailment.block_walker import AILBlockWalkerBase
