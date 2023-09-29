@@ -123,31 +123,33 @@ class EagerReturnsSimplifier(OptimizationPass):
         # the sources of incoming edges
         self.graph_copy = networkx.DiGraph(self._graph)
         self.last_graph = None
+        success, _ = self._structure_graph()
+        if not success:
+            # incoming graph could not structure anyway
+            return
+
+        initial_gotos = self.goto_manager.gotos
         graph_updated = False
 
         # attempt at most N levels
         for _ in range(self.max_level):
-            success, graph_has_gotos = self._structure_graph()
-            if not success:
-                self.graph_copy = self.last_graph
-                break
-
-            #if not graph_has_gotos:
-            #    _l.debug("Graph has no gotos. Leaving analysis...")
-            #    break
-
-            # make a clone of graph copy to recover in the event of failure
-            self.last_graph = self.graph_copy.copy()
             r = self._analyze_core(self.graph_copy)
             if not r:
                 break
-            graph_updated = True
+
+            success, _ = self._structure_graph()
+            if success:
+                self.last_graph = self.graph_copy.copy()
+                graph_updated = True
+            else:
+                # on first failure, we revert to the last graph, and stop analysis
+                self.graph_copy = self.last_graph
+                break
 
         # the output graph
-        if graph_updated and self.graph_copy is not None:
-            success, graph_has_gotos = self._structure_graph()
-            if not success:
-                self.last_graph = self.graph_copy
+        if graph_updated and self.graph_copy is not None and self.goto_manager is not None:
+            if self.goto_manager.gotos and len(self.goto_manager.gotos) > len(initial_gotos):
+                return
 
             if self.graph_copy is not None:
                 self.out_graph = add_labels(remove_labels(self.graph_copy))
