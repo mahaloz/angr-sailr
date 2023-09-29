@@ -18,7 +18,9 @@ from ailment.block_walker import AILBlockWalkerBase
 
 from ..condition_processor import ConditionProcessor, EmptyBlockNotice
 from .optimization_pass import OptimizationPass, OptimizationPassStage
+from ..graph_region import GraphRegion
 from ..structuring import RecursiveStructurer, PhoenixStructurer
+from ..structuring.structurer_nodes import MultiNode
 from ..utils import add_labels, remove_labels
 
 if TYPE_CHECKING:
@@ -177,6 +179,25 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.goto_manager = rs.goto_manager
         return True, len(self.goto_manager.gotos) != 0
 
+    def _analyze_core(self, graph: networkx.DiGraph):
+        graph_changed = False
+        endnode_regions = self._find_endnode_regions(graph)
+        endnode_regions = self._copy_connected_edge_components(endnode_regions, graph)
+        for region_head, (in_edges, region) in endnode_regions.items():
+            is_single_const_ret_region = self._is_single_constant_return_graph(region)
+            for in_edge in in_edges:
+                pred_node = in_edge[0]
+                if self._should_duplicate_dst(pred_node, region_head, graph, dst_is_const_ret=is_single_const_ret_region):
+                    # every eligible pred gets a new region copy
+                    self._copy_region([pred_node], region_head, region, graph)
+
+            if region_head in graph and graph.in_degree(region_head) == 0:
+                graph.remove_nodes_from(region)
+
+            graph_changed = True
+
+        return graph_changed
+
     def _is_goto_edge(
         self, src: ailment.Block, dst: ailment.Block, graph: nx.DiGraph = None, check_for_ifstmts=True,
         max_level_check=1
@@ -197,7 +218,15 @@ class EagerReturnsSimplifier(OptimizationPass):
                 blocks += new_level_blocks
                 level_blocks = new_level_blocks
 
+            src_direct_parents = [p for p in graph.predecessors(src)]
             for block in blocks:
+                if not block or not block.statements:
+                    continue
+
+                # special case if-stmts that are next to each other
+                if block in src_direct_parents and isinstance(block.statements[-1], ConditionalJump):
+                    continue
+
                 if self.goto_manager.is_goto_edge(block, dst):
                     return True
         else:
@@ -256,54 +285,96 @@ class EagerReturnsSimplifier(OptimizationPass):
 
         return end_node_regions
 
-    def _analyze_core(self, graph: networkx.DiGraph):
-        graph_changed = False
-        to_update = self._find_endnode_regions(graph)
-        for region_head, (in_edges, region) in to_update.items():
+    def _should_duplicate_dst(self, src, dst, graph, dst_is_const_ret=False):
+        # returns that are only returning a constant should be duplicated always;
+        if dst_is_const_ret:
+            return True
+
+        # check above
+        return self._is_goto_edge(src, dst, graph=graph, check_for_ifstmts=True)
+
+    def _copy_region(self, pred_nodes, region_head, region, graph):
+        # copy the entire return region
+        copies = {}
+        queue = [(pred_node, region_head) for pred_node in pred_nodes]
+        while queue:
+            pred, node = queue.pop(0)
+            if node in copies:
+                node_copy = copies[node]
+            else:
+                node_copy = copy.deepcopy(node)
+                node_copy.idx = next(self.node_idx)
+                copies[node] = node_copy
+
+            # modify Jump.target_idx accordingly
+            graph.add_edge(pred, node_copy)
+            try:
+                last_stmt = ConditionProcessor.get_last_statement(pred)
+                if isinstance(last_stmt, Jump) and isinstance(last_stmt.target, Const):
+                    if last_stmt.target.value == node_copy.addr:
+                        last_stmt.target_idx = node_copy.idx
+            except EmptyBlockNotice:
+                pass
+
+            for succ in region.successors(node):
+                queue.append((node_copy, succ))
+
+        for pred_node in pred_nodes:
+            # delete the old edge to the return node
+            graph.remove_edge(pred_node, region_head)
+
+    def _copy_connected_edge_components(self, endnode_regions:  Dict[Any, Tuple[List[Tuple[Any, Any]], networkx.DiGraph]], graph: networkx.DiGraph):
+        updated_regions = endnode_regions.copy()
+        all_region_block_addrs = list(self._find_block_sets_in_all_regions(self.ri.region).values())
+        for region_head, (in_edges, region) in endnode_regions.items():
             is_single_const_ret_region = self._is_single_constant_return_graph(region)
-            for in_edge in in_edges:
-                pred_node = in_edge[0]
+            pred_nodes = [src for src, _ in in_edges]
+            pred_subgraph = networkx.subgraph(graph, pred_nodes)
+            components = list(nx.weakly_connected_components(pred_subgraph))
+            multi_node_components = [c for c in components if len(c) > 1]
+            if not multi_node_components:
+                continue
 
-                # returns that are only returning a constant should be duplicated always;
-                # returns that do anything more than a const ret, need to be checked for gotos
-                if not is_single_const_ret_region:
-                    if not self._is_goto_edge(pred_node, region_head, graph=graph, check_for_ifstmts=True):
-                        continue
+            # find components that have a node that should be duplicated
+            candidate_components = []
+            for nodes in multi_node_components:
+                if any(
+                    self._should_duplicate_dst(n, region_head, graph, dst_is_const_ret=is_single_const_ret_region)
+                    for n in nodes
+                ):
+                    candidate_components.append(nodes)
+            if not candidate_components:
+                continue
 
-                # copy the entire return region
-                copies = {}
-                queue = [(pred_node, region_head)]
-                while queue:
-                    pred, node = queue.pop(0)
-                    if node in copies:
-                        node_copy = copies[node]
-                    else:
-                        node_copy = copy.deepcopy(node)
-                        node_copy.idx = next(self.node_idx)
-                        copies[node] = node_copy
+            # we can only handle instances where components do not overlap
+            overlapping_comps = set()
+            for component in candidate_components:
+                overlapping_comps &= component
+            if overlapping_comps:
+                continue
 
-                    # modify Jump.target_idx accordingly
-                    graph.add_edge(pred, node_copy)
-                    try:
-                        last_stmt = ConditionProcessor.get_last_statement(pred)
-                        if isinstance(last_stmt, Jump) and isinstance(last_stmt.target, Const):
-                            if last_stmt.target.value == node_copy.addr:
-                                last_stmt.target_idx = node_copy.idx
-                    except EmptyBlockNotice:
-                        pass
+            # every component needs to form its own region with ONLY those nodes in the region
+            duplicatable_components = []
+            for component in candidate_components:
+                comp_addrs = {n.addr for n in component}
+                if comp_addrs in all_region_block_addrs:
+                    duplicatable_components.append(component)
 
-                    for succ in region.successors(node):
-                        queue.append((node_copy, succ))
+            new_in_edges = in_edges
+            for nodes in duplicatable_components:
+                self._copy_region(nodes, region_head, region, graph)
+                if region_head in graph and graph.in_degree(region_head) == 0:
+                    graph.remove_nodes_from(region)
 
-                # delete the old edge to the return node
-                graph.remove_edge(pred_node, region_head)
+                # update the in_edges to remove any nodes that have been copied
+                new_in_edges = list(filter(lambda e: e[0] not in nodes, new_in_edges))
 
-            if region_head in graph and graph.in_degree(region_head) == 0:
-                graph.remove_nodes_from(region)
+            if not new_in_edges:
+                del updated_regions[region_head]
+            else:
+                updated_regions[region_head] = new_in_edges, region
 
-            graph_changed = True
-
-        return graph_changed
+        return updated_regions
 
     @staticmethod
     def _is_single_constant_return_graph(graph: networkx.DiGraph):
@@ -437,3 +508,35 @@ class EagerReturnsSimplifier(OptimizationPass):
                     if not isinstance(stmt, valid_stmt_types):
                         return False
         return True
+
+    @staticmethod
+    def _find_block_sets_in_all_regions(top_region: GraphRegion):
+        def _unpack_region_to_block_addrs(region: GraphRegion):
+            region_addrs = set()
+            for node in region.graph.nodes:
+                if isinstance(node, Block):
+                    region_addrs.add(node.addr)
+                elif isinstance(node, MultiNode):
+                    for _node in node.nodes:
+                        region_addrs.add(_node.addr)
+                elif isinstance(node, GraphRegion):
+                    region_addrs |= _unpack_region_to_block_addrs(node)
+
+            return region_addrs
+
+        def _unpack_every_region(region: GraphRegion, addrs_by_region: dict):
+            addrs_by_region[region] = set()
+            for node in region.graph.nodes:
+                if isinstance(node, Block):
+                    addrs_by_region[region].add(node.addr)
+                elif isinstance(node, MultiNode):
+                    for _node in node.nodes:
+                        addrs_by_region[region].add(_node.addr)
+                else:
+                    addrs_by_region[region] |= _unpack_region_to_block_addrs(node)
+                    _unpack_every_region(node, addrs_by_region)
+
+        all_region_block_sets = {}
+        _unpack_every_region(top_region, all_region_block_sets)
+        return all_region_block_sets
+
