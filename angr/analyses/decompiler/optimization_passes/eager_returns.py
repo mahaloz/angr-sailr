@@ -60,15 +60,8 @@ class EagerReturnsSimplifier(OptimizationPass):
                             same hash.
     """
 
-    # TODO: This optimization pass may support more architectures and platforms
-    ARCHES = [
-        "X86",
-        "AMD64",
-        "ARMCortexM",
-        "ARMHF",
-        "ARMEL",
-    ]
-    PLATFORMS = ["cgc", "linux"]
+    ARCHES = None
+    PLATFORMS = None
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Duplicate return blocks to reduce goto statements"
     DESCRIPTION = inspect.cleandoc(__doc__[: __doc__.index(":ivar")])  # pylint:disable=unsubscriptable-object
@@ -76,37 +69,24 @@ class EagerReturnsSimplifier(OptimizationPass):
     def __init__(
         self,
         func,
-        blocks_by_addr=None,
-        blocks_by_addr_and_idx=None,
-        graph=None,
         # internal parameters that should be used by Clinic
         node_idx_start=0,
         # settings
-        max_level=10,
-        min_indegree=2,
+        max_runs=10,
         max_calls_in_regions=2,
-        reaching_definitions=None,
-        region_identifier=None,
-        max_level_goto_check=2,
+        minimize_copies_for_regions=True,
         **kwargs,
     ):
-        super().__init__(
-            func, blocks_by_addr=blocks_by_addr, blocks_by_addr_and_idx=blocks_by_addr_and_idx, graph=graph, **kwargs
-        )
+        super().__init__(func, **kwargs)
 
-        self.max_level = max_level
-        self.min_indegree = min_indegree
-        self.max_level_goto_check = max_level_goto_check
+        self._max_analysis_runs = max_runs
+        self._max_calls_in_region = max_calls_in_regions
+        self._minimize_copies_for_regions = minimize_copies_for_regions
+
         self.node_idx = count(start=node_idx_start)
-        self._rd = reaching_definitions
-        self.max_calls_in_region = max_calls_in_regions
-        self.ri = region_identifier
-
         self.goto_manager: Optional[GotoManager] = None
-        self.func_name = self._func.name
-        self.binary_name = self.project.loader.main_object.binary_basename
-        self.target_name = f"{self.binary_name}.{self.func_name}"
         self.graph_copy = None
+
         self.analyze()
 
     def _check(self):
@@ -132,7 +112,7 @@ class EagerReturnsSimplifier(OptimizationPass):
         graph_updated = False
 
         # attempt at most N levels
-        for _ in range(self.max_level):
+        for _ in range(self._max_analysis_runs):
             r = self._analyze_core(self.graph_copy)
             if not r:
                 break
@@ -163,18 +143,18 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.goto_manager = None
 
         # do structuring
-        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
-            self._func, graph=self.graph_copy, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+        self._ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=self.graph_copy, cond_proc=self._ri.cond_proc, force_loop_single_exit=False,
             complete_successors=True
         )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
-            copy.deepcopy(self.ri.region),
-            cond_proc=self.ri.cond_proc,
+            copy.deepcopy(self._ri.region),
+            cond_proc=self._ri.cond_proc,
             func=self._func,
             structurer_cls=PhoenixStructurer
         )
         if not rs.result.nodes:
-            _l.critical(f"Failed to redo structuring on {self.target_name}")
+            _l.critical(f"Failed to redo structuring")
             return False, False
 
         rs = self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
@@ -184,7 +164,12 @@ class EagerReturnsSimplifier(OptimizationPass):
     def _analyze_core(self, graph: networkx.DiGraph):
         graph_changed = False
         endnode_regions = self._find_endnode_regions(graph)
-        endnode_regions = self._copy_connected_edge_components(endnode_regions, graph)
+
+        if self._minimize_copies_for_regions:
+            # perform a second pass to minimize the number of copies by doing only a single copy
+            # for connected in_edges that form a region
+            endnode_regions = self._copy_connected_edge_components(endnode_regions, graph)
+
         for region_head, (in_edges, region) in endnode_regions.items():
             is_single_const_ret_region = self._is_single_constant_return_graph(region)
             for in_edge in in_edges:
@@ -271,16 +256,13 @@ class EagerReturnsSimplifier(OptimizationPass):
             if len(in_edges) == 1:
                 # there is no need to duplicate it
                 continue
-            if len(in_edges) < self.min_indegree:
-                # does not meet the threshold
-                continue
 
             if any(self._is_indirect_jump_ailblock(src) for src, _ in in_edges):
                 continue
 
             # to assure we are not copying like crazy, set a max amount of code (which is estimated in calls)
             # that can be copied in a region
-            if self._number_of_calls_in(region) > self.max_calls_in_region:
+            if self._number_of_calls_in(region) > self._max_calls_in_region:
                 continue
 
             end_node_regions[region_head] = in_edges, region
@@ -308,13 +290,24 @@ class EagerReturnsSimplifier(OptimizationPass):
                 node_copy.idx = next(self.node_idx)
                 copies[node] = node_copy
 
-            # modify Jump.target_idx accordingly
+            # modify Jump.target_idx and ConditionalJump.{true,false}_target_idx accordingly
             graph.add_edge(pred, node_copy)
             try:
                 last_stmt = ConditionProcessor.get_last_statement(pred)
-                if isinstance(last_stmt, Jump) and isinstance(last_stmt.target, Const):
-                    if last_stmt.target.value == node_copy.addr:
+                if isinstance(last_stmt, Jump):
+                    if isinstance(last_stmt.target, Const) and last_stmt.target.value == node_copy.addr:
                         last_stmt.target_idx = node_copy.idx
+                elif isinstance(last_stmt, ConditionalJump):
+                    if (
+                            isinstance(last_stmt.true_target, Const)
+                            and last_stmt.true_target.value == node_copy.addr
+                    ):
+                        last_stmt.true_target_idx = node_copy.idx
+                    elif (
+                            isinstance(last_stmt.false_target, Const)
+                            and last_stmt.false_target.value == node_copy.addr
+                    ):
+                        last_stmt.false_target_idx = node_copy.idx
             except EmptyBlockNotice:
                 pass
 
@@ -327,7 +320,7 @@ class EagerReturnsSimplifier(OptimizationPass):
 
     def _copy_connected_edge_components(self, endnode_regions:  Dict[Any, Tuple[List[Tuple[Any, Any]], networkx.DiGraph]], graph: networkx.DiGraph):
         updated_regions = endnode_regions.copy()
-        all_region_block_addrs = list(self._find_block_sets_in_all_regions(self.ri.region).values())
+        all_region_block_addrs = list(self._find_block_sets_in_all_regions(self._ri.region).values())
         for region_head, (in_edges, region) in endnode_regions.items():
             is_single_const_ret_region = self._is_single_constant_return_graph(region)
             pred_nodes = [src for src, _ in in_edges]
