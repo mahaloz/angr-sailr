@@ -7,7 +7,7 @@ import inspect
 import networkx
 import networkx as nx
 
-from ailment.statement import Jump, ConditionalJump
+from ailment.statement import Jump, ConditionalJump, Assignment
 from ailment.expression import Const
 import ailment
 from ailment import Block
@@ -21,7 +21,7 @@ from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ..graph_region import GraphRegion
 from ..structuring import RecursiveStructurer, PhoenixStructurer
 from ..structuring.structurer_nodes import MultiNode
-from ..utils import add_labels, remove_labels
+from ..utils import add_labels, remove_labels, to_ail_supergraph
 
 if TYPE_CHECKING:
     from ailment import Block
@@ -144,17 +144,20 @@ class EagerReturnsSimplifier(OptimizationPass):
 
         # do structuring
         self._ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
-            self._func, graph=self.graph_copy, cond_proc=self._ri.cond_proc, force_loop_single_exit=False,
-            complete_successors=True
+            self._func,
+            graph=self.graph_copy,
+            cond_proc=self._ri.cond_proc,
+            force_loop_single_exit=False,
+            complete_successors=True,
         )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
             copy.deepcopy(self._ri.region),
             cond_proc=self._ri.cond_proc,
             func=self._func,
-            structurer_cls=PhoenixStructurer
+            structurer_cls=PhoenixStructurer,
         )
         if not rs.result.nodes:
-            _l.critical(f"Failed to redo structuring")
+            _l.critical("Failed to redo structuring")
             return False, False
 
         rs = self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
@@ -174,7 +177,9 @@ class EagerReturnsSimplifier(OptimizationPass):
             is_single_const_ret_region = self._is_single_constant_return_graph(region)
             for in_edge in in_edges:
                 pred_node = in_edge[0]
-                if self._should_duplicate_dst(pred_node, region_head, graph, dst_is_const_ret=is_single_const_ret_region):
+                if self._should_duplicate_dst(
+                    pred_node, region_head, graph, dst_is_const_ret=is_single_const_ret_region
+                ):
                     # every eligible pred gets a new region copy
                     self._copy_region([pred_node], region_head, region, graph)
 
@@ -186,8 +191,12 @@ class EagerReturnsSimplifier(OptimizationPass):
         return graph_changed
 
     def _is_goto_edge(
-        self, src: ailment.Block, dst: ailment.Block, graph: nx.DiGraph = None, check_for_ifstmts=True,
-        max_level_check=1
+        self,
+        src: ailment.Block,
+        dst: ailment.Block,
+        graph: nx.DiGraph = None,
+        check_for_ifstmts=True,
+        max_level_check=1,
     ):
         """
         This function only exists because a long-standing bug that sometimes reports the if-stmt addr
@@ -298,15 +307,9 @@ class EagerReturnsSimplifier(OptimizationPass):
                     if isinstance(last_stmt.target, Const) and last_stmt.target.value == node_copy.addr:
                         last_stmt.target_idx = node_copy.idx
                 elif isinstance(last_stmt, ConditionalJump):
-                    if (
-                            isinstance(last_stmt.true_target, Const)
-                            and last_stmt.true_target.value == node_copy.addr
-                    ):
+                    if isinstance(last_stmt.true_target, Const) and last_stmt.true_target.value == node_copy.addr:
                         last_stmt.true_target_idx = node_copy.idx
-                    elif (
-                            isinstance(last_stmt.false_target, Const)
-                            and last_stmt.false_target.value == node_copy.addr
-                    ):
+                    elif isinstance(last_stmt.false_target, Const) and last_stmt.false_target.value == node_copy.addr:
                         last_stmt.false_target_idx = node_copy.idx
             except EmptyBlockNotice:
                 pass
@@ -318,7 +321,9 @@ class EagerReturnsSimplifier(OptimizationPass):
             # delete the old edge to the return node
             graph.remove_edge(pred_node, region_head)
 
-    def _copy_connected_edge_components(self, endnode_regions:  Dict[Any, Tuple[List[Tuple[Any, Any]], networkx.DiGraph]], graph: networkx.DiGraph):
+    def _copy_connected_edge_components(
+        self, endnode_regions: Dict[Any, Tuple[List[Tuple[Any, Any]], networkx.DiGraph]], graph: networkx.DiGraph
+    ):
         updated_regions = endnode_regions.copy()
         all_region_block_addrs = list(self._find_block_sets_in_all_regions(self._ri.region).values())
         for region_head, (in_edges, region) in endnode_regions.items():
@@ -375,30 +380,62 @@ class EagerReturnsSimplifier(OptimizationPass):
     def _is_single_constant_return_graph(graph: networkx.DiGraph):
         """
         Check if the graph is a single block that returns a constant.
+        TODO: update the naming of this function, as now it returns true if the return target
+        is NOT a constant, but instead a graph with only returns and jumps.
         """
-        labeless_graph = remove_labels(graph)
+        labeless_graph = to_ail_supergraph(remove_labels(graph))
         nodes = list(labeless_graph.nodes())
-        if len(nodes) != 1:
+        if not nodes:
             return False
 
-        return_node: Block = nodes[0]
-        stmts = return_node.statements
-        if not stmts or len(stmts) != 1:
+        # check if the graph is a single successor chain
+        if not all(labeless_graph.out_degree(n) <= 1 for n in nodes):
             return False
 
-        stmt = stmts[0]
-        if not isinstance(stmt, Return):
+        # collect the statements from the top node
+        root_nodes = [n for n in nodes if labeless_graph.in_degree(n) == 0]
+        if len(root_nodes) != 1:
             return False
 
-        ret_exprs = stmt.ret_exprs
-        if not ret_exprs or len(ret_exprs) != 1:
+        root_node = root_nodes[0]
+        queue = [root_node]
+        stmts = []
+        while queue:
+            node = queue.pop(0)
+            succs = list(labeless_graph.successors(node))
+            queue += succs
+            if node.statements:
+                stmts += node.statements
+
+        # all statements must be either a return, a jump, or an assignment
+        ok_stmts = [s for s in stmts if isinstance(s, (Return, Jump, Assignment))]
+        if len(ok_stmts) != len(stmts):
             return False
 
-        ret_expr = ret_exprs[0]
-        if isinstance(ret_expr, ailment.Expr.Convert):
-            ret_expr = ret_expr.operand
+        # gather all assignments
+        assignments = [s for s in stmts if isinstance(s, Assignment)]
+        has_assign = len(assignments) > 0
+        if len(assignments) > 1:
+            return False
 
-        return isinstance(ret_expr, ailment.Expr.Const)
+        # gather return stmts
+        ret_stmt = stmts[-1]
+        ret_exprs = ret_stmt.ret_exprs
+        # must be 1 or none
+        if ret_exprs and len(ret_exprs) > 1:
+            return False
+
+        ret_expr = ret_exprs[0] if ret_exprs and len(ret_exprs) == 1 else None
+        # stop early if there are no assignments at all and just jumps and rets, or a const ret
+        if not has_assign:
+            return True
+
+        # check if the assignment is assigning a constant
+        assign: Assignment = assignments[0]
+        if not isinstance(assign.src, Const):
+            return False
+
+        return ret_expr and ret_expr.likes(assign.dst)
 
     @staticmethod
     def _number_of_calls_in(graph: networkx.DiGraph) -> int:
@@ -534,4 +571,3 @@ class EagerReturnsSimplifier(OptimizationPass):
         all_region_block_sets = {}
         _unpack_every_region(top_region, all_region_block_sets)
         return all_region_block_sets
-
