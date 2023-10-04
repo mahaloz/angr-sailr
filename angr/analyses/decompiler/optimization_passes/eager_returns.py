@@ -7,7 +7,7 @@ import inspect
 import networkx
 import networkx as nx
 
-from ailment.statement import Jump, ConditionalJump, Assignment
+from ailment.statement import Jump, ConditionalJump, Assignment, Statement
 from ailment.expression import Const
 import ailment
 from ailment import Block
@@ -41,6 +41,10 @@ class AILCallCounter(AILBlockWalkerBase):
     def _handle_Call(self, stmt_idx: int, stmt: "Call", block: Optional["Block"]):
         self.calls += 1
         super()._handle_Call(stmt_idx, stmt, block)
+
+    def _handle_CallExpr(self, expr_idx: int, expr: "Call", stmt_idx: int, stmt: Statement, block: Optional[Block]):
+        self.calls += 1
+        super()._handle_CallExpr(expr_idx, expr, stmt_idx, stmt, block)
 
 
 class EagerReturnsSimplifier(OptimizationPass):
